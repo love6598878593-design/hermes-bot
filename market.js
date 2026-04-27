@@ -48,6 +48,24 @@ async function fetchPolymarketData(coin, markets) {
 }
 
 /**
+ * 获取 Binance 实时价格
+ */
+async function fetchBinancePrice(coin) {
+  try {
+    if (coin === "HYPE") return null;
+    const symbol = coin + "USDT";
+    const res = await axios.get(`https://api.binance.com/api/v3/ticker/price`, {
+      params: { symbol },
+      timeout: 5000
+    });
+    return parseFloat(res.data.price);
+  } catch (err) {
+    console.error(`   ${coin} Binance error: ${err.message}`);
+    return null;
+  }
+}
+
+/**
  * 获取真实 Binance K 线数据（用于真实波动率计算）
  */
 async function fetchBinanceKlines(coin, interval = "5m", limit = 12) {
