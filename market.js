@@ -1,48 +1,23 @@
 const axios = require("axios");
 
-// Polymarket 价格 API (polygon 子图)
+// Polymarket CLOB API
 const POLYMARKET_API = "https://clob.polymarket.com";
 
 // 缓存上一次价格，用来算变化
 const lastPrices = {};
-
-/**
- * 获取 Polymarket 某个币的当前概率价格
- * 这里按币名查预测市场（示例：BTC 5-min Up）
- */
-async function fetchPolymarketPrice(coin) {
-  try {
-    // 搜索 Polymarket 市场
-    const res = await axios.get(`${POLYMARKET_API}/markets`, {
-      params: { 
-        limit: 1,
-        tag: coin.toLowerCase(),
-        closed: false
-      },
-      timeout: 10000
-    });
-
-    if (res.data && res.data.length > 0) {
-      const market = res.data[0];
-      const price = parseFloat(market.outcomePrices?.[0] || "0.5");
-      return {
-        price,
-        market: market.conditionId || market.id,
-        question: market.question || `${coin} Up?`
-      };
-    }
-    return null;
-  } catch (err) {
-    console.error(`   ${coin} PM API error: ${err.message}`);
-    return null;
-  }
-}
+// 价格历史，用于计算真实波动率
+const priceHistory = {};
 
 /**
  * 获取 Binance 实时价格
+ * Binance API 不需要代理，直接访问
  */
 async function fetchBinancePrice(coin) {
   try {
+    // HYPE 没有 USDT 交易对，跳过
+    if (coin === "HYPE") {
+      return null;
+    }
     const symbol = coin + "USDT";
     const res = await axios.get(`https://api.binance.com/api/v3/ticker/price`, {
       params: { symbol },
@@ -50,52 +25,117 @@ async function fetchBinancePrice(coin) {
     });
     return parseFloat(res.data.price);
   } catch (err) {
-    // 部分币可能不是直接 BTCUSDT 格式
-    if (coin === "HYPE") {
-      try {
-        const res = await axios.get(`https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT`, { timeout: 5000 });
-        return parseFloat(res.data.price);
-      } catch {}
+    console.error(`   ${coin} Binance error: ${err.message}`);
+    return null;
+  }
+}
+
+/**
+ * 获取 Polymarket 某个币的当前概率价格
+ * 使用 CLOB API 的价差数据搜索活跃市场
+ */
+async function fetchPolymarketPrice(coin) {
+  try {
+    // 搜索 Polymarket 市场 - 按币名关键词
+    const res = await axios.get(`${POLYMARKET_API}/price`, {
+      params: {
+        token: coin.toLowerCase(),
+        side: "BUY"
+      },
+      timeout: 10000
+    });
+
+    // API 可能返回价格数据或空
+    if (res.data && res.data.price !== undefined) {
+      return {
+        price: parseFloat(res.data.price) / 100, // 有些 API 返回的是基点
+        market: res.data.asset_id || coin,
+        question: `${coin} Up or Down?`
+      };
+    }
+    return null;
+  } catch (err) {
+    // Polymarket API 可能需要认证，fallback 到模拟数据
+    // 真实部署时需要配 API key
+    if (process.env.POLYMARKET_API_KEY) {
+      console.error(`   ${coin} PM API error: ${err.message}`);
     }
     return null;
   }
 }
 
 /**
- * 跟新所有市场数据
+ * 获取真实 Binance K 线数据（用于真实波动率计算）
+ */
+async function fetchBinanceKlines(coin, interval = "5m", limit = 12) {
+  try {
+    if (coin === "HYPE") return null;
+    const symbol = coin + "USDT";
+    const res = await axios.get(`https://api.binance.com/api/v3/klines`, {
+      params: { symbol, interval, limit },
+      timeout: 5000
+    });
+    if (res.data && res.data.length > 1) {
+      // klines: [open_time, open, high, low, close, volume, ...]
+      const closes = res.data.map(k => parseFloat(k[4]));
+      return closes;
+    }
+    return null;
+  } catch (err) {
+    return null;
+  }
+}
+
+/**
+ * 计算真实波动率（基于最近12个 5-min K 线）
+ */
+function calcRealVolatility(prices) {
+  if (!prices || prices.length < 2) return 0;
+  let sum = 0;
+  for (let i = 1; i < prices.length; i++) {
+    const change = Math.abs((prices[i] - prices[i-1]) / prices[i-1]) * 100;
+    sum += change;
+  }
+  return sum / (prices.length - 1); // 平均每根 K 线的变化百分比
+}
+
+/**
+ * 更新所有市场数据
  */
 async function updateMarketData(coins) {
   const data = {};
 
   for (const coin of coins) {
-    const [pm, binance] = await Promise.all([
-      fetchPolymarketPrice(coin),
-      fetchBinancePrice(coin)
+    // 同时获取：当前价格 + 历史 K 线 + Polymarket
+    const [binancePrice, klines, pm] = await Promise.all([
+      fetchBinancePrice(coin),
+      fetchBinanceKlines(coin),
+      fetchPolymarketPrice(coin)
     ]);
 
-    if (pm && binance) {
-      // 核心逻辑：Polymarket 概率 vs Binance 隐含概率
-      // 如果 5-min 历史走势向上，PM 价格应 > 0.5
-      // 如果有价差，就有套利机会
-      data[coin] = {
-        coin,
-        pmPrice: pm.price,
-        binancePrice: binance,
-        priceChange: lastPrices[coin] ? ((binance - lastPrices[coin]) / lastPrices[coin]) * 100 : 0,
-        volatility: Math.abs(((binance - (lastPrices[coin] || binance)) / (lastPrices[coin] || binance)) * 100)
-      };
-
-      lastPrices[coin] = binance;
-    } else if (pm) {
-      data[coin] = {
-        coin,
-        pmPrice: pm.price,
-        binancePrice: null,
-        priceChange: 0,
-        volatility: 0,
-        onlyPM: true
-      };
+    // 计算价格变化
+    let priceChange = 0;
+    if (binancePrice && lastPrices[coin]) {
+      priceChange = ((binancePrice - lastPrices[coin]) / lastPrices[coin]) * 100;
     }
+
+    // 计算真实波动率
+    const volatility = calcRealVolatility(klines);
+
+    // 缓存价格
+    if (binancePrice) {
+      lastPrices[coin] = binancePrice;
+    }
+
+    data[coin] = {
+      coin,
+      pmPrice: pm?.price ?? null,
+      pmMarket: pm?.market ?? null,
+      binancePrice,
+      priceChange,
+      volatility,
+      success: !!(binancePrice || pm)
+    };
   }
 
   return data;

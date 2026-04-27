@@ -4,72 +4,97 @@
  */
 
 const MAX_CONSECUTIVE_LOSSES = 3;
-const MAX_DAILY_LOSS = -50;   // 每日最大亏损 $50
-const MAX_SINGLE_TRADE = 50;  // 单笔最大 $50
-const MAX_OPEN_POSITIONS = 5; // 最多同时持仓数
+const MAX_DAILY_LOSS = -50;
+const MAX_SINGLE_TRADE = 40;
+const MAX_TRADES_PER_CYCLE = 3;
 
 let lossStreak = 0;
-let openPositions = 0;
-let dailyPnL = 0;
-let lastResetDay = new Date().getDate();
+let totalTrades = 0;
+let sessionStartTime = Date.now();
+let cycleTradeCount = 0;
 
-function checkRisk(signal, tradeCount, totalProfit) {
-  if (!signal) return false;
+/**
+ * 检查是否允许交易
+ * @param {object} signal - 交易信号
+ * @param {number} totalProfit - 当前总利润
+ */
+function checkRisk(signal, totalProfit) {
+  if (!signal || !signal.action) return false;
 
-  // 1. 每日盈亏重置
-  const today = new Date().getDate();
-  if (today !== lastResetDay) {
-    dailyPnL = 0;
-    lastResetDay = today;
-  }
-  dailyPnL = totalProfit; // 用总利润代替
-
-  // 2. 单笔大小限制
+  // 1. 单笔大小限制
   if (signal.size > MAX_SINGLE_TRADE) {
-    console.log(`   ⛔ Trade size ${signal.size} > max ${MAX_SINGLE_TRADE}`);
+    console.log(`   ⛔ Trade size $${signal.size} > max $${MAX_SINGLE_TRADE}`);
+    return false;
+  }
+  if (signal.size < 1) {
+    console.log(`   ⛔ Trade size $${signal.size} too small`);
     return false;
   }
 
-  // 3. 连续亏损熔断
+  // 2. 连续亏损熔断
   if (lossStreak >= MAX_CONSECUTIVE_LOSSES) {
-    console.log(`   ⛔ ${lossStreak} consecutive losses, cooling down`);
+    console.log(`   ⛔ ${lossStreak} consecutive losses — cooling down`);
     return false;
   }
 
-  // 4. 日亏损限额
-  if (dailyPnL < MAX_DAILY_LOSS) {
-    console.log(`   ⛔ Daily loss limit reached: $${dailyPnL.toFixed(2)}`);
+  // 3. 全局日亏损限额（基于 session 总利润）
+  if (totalProfit < MAX_DAILY_LOSS) {
+    console.log(`   ⛔ Session loss limit: $${totalProfit.toFixed(2)} < $${MAX_DAILY_LOSS}`);
     return false;
   }
 
-  // 5. 最大持仓数
-  if (openPositions >= MAX_OPEN_POSITIONS) {
-    console.log(`   ⛔ Max ${MAX_OPEN_POSITIONS} positions open`);
+  // 4. 单 cycle 交易数限制
+  if (cycleTradeCount >= MAX_TRADES_PER_CYCLE) {
+    console.log(`   ⛔ Max ${MAX_TRADES_PER_CYCLE} trades this cycle`);
     return false;
   }
 
   return true;
 }
 
-// 记录盈亏（供外部调用）
+/**
+ * 记录盈亏结果
+ */
 function recordPnL(profit) {
+  totalTrades++;
+
   if (profit < 0) {
     lossStreak++;
   } else {
     lossStreak = 0;
   }
 
-  if (profit > 0) {
-    openPositions++;
-  } else {
-    openPositions = Math.max(0, openPositions - 1);
-  }
+  // 记录 cycle 交易数
+  cycleTradeCount++;
 }
 
-// 手动重置状态
+/**
+ * 重置 cycle 计数器（每轮 bot 循环开始时调用）
+ */
+function resetCycleCounter() {
+  cycleTradeCount = 0;
+}
+
+/**
+ * 获取风控摘要
+ */
+function getRiskSummary() {
+  return {
+    lossStreak,
+    totalTrades,
+    uptime: Math.floor((Date.now() - sessionStartTime) / 1000) + 's',
+    cycleTrades: cycleTradeCount
+  };
+}
+
+/**
+ * 手动重置所有风控状态
+ */
 function resetRisk() {
   lossStreak = 0;
-  openPositions = 0;
+  totalTrades = 0;
+  cycleTradeCount = 0;
+  sessionStartTime = Date.now();
 }
 
-module.exports = { checkRisk, recordPnL, resetRisk };
+module.exports = { checkRisk, recordPnL, resetCycleCounter, getRiskSummary, resetRisk };

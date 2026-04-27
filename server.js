@@ -1,20 +1,23 @@
 require("dotenv").config();
 const { getSignal } = require("./strategy");
 const { executeTrade } = require("./exchange");
-const { checkRisk } = require("./risk");
+const { checkRisk, recordPnL, resetCycleCounter, getRiskSummary } = require("./risk");
 const { updateMarketData } = require("./market");
 
 // 7 个核心币
 const COINS = ["BTC", "ETH", "SOL", "XRP", "DOGE", "HYPE", "BNB"];
 let marketData = {};
 let tradeCount = 0;
-let profitTotal = 0;
+let cyclePnL = 0; // 单次 cycle 的盈亏
+let totalProfit = 0;
 
 async function runBot() {
+  cyclePnL = 0;
   console.log(`\n[${new Date().toISOString()}] 🤖 Running bot cycle #${++tradeCount}...`);
 
   try {
-    // 1. 更新市场数据
+    // 1. 重置 cycle 计数器
+    resetCycleCounter();
     marketData = await updateMarketData(COINS);
     console.log(`   Market: ${Object.keys(marketData).length} coins loaded`);
 
@@ -31,7 +34,7 @@ async function runBot() {
       }
 
       // 3. 风控检查
-      const allowed = checkRisk(signal, tradeCount, profitTotal);
+      const allowed = checkRisk(signal, totalProfit);
       if (!allowed) {
         console.log(`   ${coin}: ⛔ Risk blocked`);
         continue;
@@ -40,12 +43,16 @@ async function runBot() {
       // 4. 执行交易
       const result = await executeTrade(coin, signal);
       if (result) {
-        profitTotal += result.profit || 0;
-        console.log(`   ${coin}: ✅ ${signal.action} $${signal.size} | PnL: $${result.profit?.toFixed(2) || 'N/A'}`);
+        const pnl = result.profit || 0;
+        cyclePnL += pnl;
+        totalProfit += pnl;
+        recordPnL(pnl);
+        console.log(`   ${coin}: ✅ ${signal.action} $${signal.size} | PnL: $${pnl.toFixed(2)}`);
       }
     }
 
-    console.log(`   Total PnL: $${profitTotal.toFixed(2)}`);
+    console.log(`   Cycle PnL: $${cyclePnL.toFixed(2)} | Total: $${totalProfit.toFixed(2)}`);
+    console.log(`   ${JSON.stringify(getRiskSummary())}`);
 
   } catch (err) {
     console.error(`   ❌ Error:`, err.message);
