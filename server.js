@@ -33,12 +33,10 @@ app.listen(PORT, () => {
   console.log(`🚀 Hermes health server on port ${PORT}`);
 });
 
-// 7 个核心币
-const COINS = ["BTC", "ETH", "SOL", "XRP", "DOGE", "HYPE", "BNB"];
-let marketData = {};
-let tradeCount = 0;
-let cyclePnL = 0; // 单次 cycle 的盈亏
-let totalProfit = 0;
+// 启动
+console.log("🚀 Hermes Bot starting...");
+console.log(`   Coins: ${COINS.join(", ")}`);
+console.log(`   Interval: ${process.env.TRADE_INTERVAL_MS || 20000}ms`);
 
 async function runBot() {
   cyclePnL = 0;
