@@ -1,8 +1,37 @@
 require("dotenv").config();
+const express = require("express");
 const { getSignal } = require("./strategy");
-const { executeTrade } = require("./exchange");
+const { executeTrade, getTradeStats } = require("./exchange");
 const { checkRisk, recordPnL, resetCycleCounter, getRiskSummary } = require("./risk");
 const { updateMarketData } = require("./market");
+
+// 7 个核心币
+const COINS = ["BTC", "ETH", "SOL", "XRP", "DOGE", "HYPE", "BNB"];
+let marketData = {};
+let tradeCount = 0;
+let cyclePnL = 0;
+let totalProfit = 0;
+let botStartTime = Date.now();
+
+// 🚀 Health check server (Railway needs this)
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+app.get("/health", (req, res) => {
+  res.json({
+    status: "ok",
+    uptime: Math.floor((Date.now() - botStartTime) / 1000),
+    timestamp: new Date().toISOString(),
+    cycles: tradeCount,
+    profit: totalProfit,
+    trades: getTradeStats(),
+    risk: getRiskSummary()
+  });
+});
+
+app.listen(PORT, () => {
+  console.log(`🚀 Hermes health server on port ${PORT}`);
+});
 
 // 7 个核心币
 const COINS = ["BTC", "ETH", "SOL", "XRP", "DOGE", "HYPE", "BNB"];
