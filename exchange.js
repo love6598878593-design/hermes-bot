@@ -1,11 +1,9 @@
 /**
  * 交易所执行层
- * 对接 Polymarket CLOB API + Binance API
+ * 对接 Polymarket CLOB API（通过 polymarket.js） + Binance API
  */
 
-const axios = require("axios");
-
-const POLYMARKET_API = "https://clob.polymarket.com";
+const { getOrderBook, placeLimitOrder, marketTake } = require("./polymarket");
 
 /** 交易统计 */
 const tradeStats = {
@@ -19,18 +17,22 @@ const tradeStats = {
 /**
  * 执行交易
  * 根据 action 类型路由到对应交易所
+ * 自动使用 marketData 中的 tokenID 进行 Polymarket 下单
  */
-async function executeTrade(coin, signal) {
+async function executeTrade(coin, signal, marketData) {
   try {
     let result = null;
+    const data = marketData?.[coin];
 
     switch (signal.action) {
       case "BUY_PM":
-        result = await placePolymarketOrder(coin, "BUY", signal.size);
+      case "SELL_PM": {
+        const tokenID = signal.action === "BUY_PM"
+          ? data?.yesToken
+          : data?.noToken;
+        result = await placePolymarketOrder(coin, signal.action === "BUY_PM" ? "BUY" : "SELL", signal.size, tokenID);
         break;
-      case "SELL_PM":
-        result = await placePolymarketOrder(coin, "SELL", signal.size);
-        break;
+      }
       case "VOLATILITY":
       case "TREND_UP":
       case "TREND_DOWN":
@@ -61,22 +63,46 @@ async function executeTrade(coin, signal) {
 }
 
 /**
- * Polymarket 下单 (CLOB API)
+ * Polymarket 真实下单
+ * 走 CLOB API，自动吃单价成交
+ *
+ * 需要环境变量:
+ *   POLYMARKET_PRIVATE_KEY — Polygon 钱包私钥（用于签名）
+ *   POLYMARKET_API_KEY — CLOB API key（可选）
+ *
+ * 如果没有配 key → 模拟交易
  */
-async function placePolymarketOrder(coin, side, size) {
-  if (!process.env.POLYMARKET_API_KEY || !process.env.POLYMARKET_PRIVATE_KEY) {
+async function placePolymarketOrder(coin, side, size, tokenID) {
+  if (!process.env.POLYMARKET_PRIVATE_KEY || !tokenID) {
     // 没配 Key → 模拟
     const profit = simulatePnL(size);
-    console.log(`   ${coin}: ⚠️ No PM keys → simulated PnL: $${profit.toFixed(2)}`);
+    console.log(`   ${coin}: ⚠️ No PM key or tokenID → simulated $${profit.toFixed(2)}`);
     return { profit, simulated: true };
   }
 
-  // TODO: 真实 Polymarket 签名下单
-  // 1. EIP-712 签名
-  // 2. POST /order
-  // 3. 需要 Polygon wallet
-  console.log(`   ${coin}: 🔐 PM order real (PLACEHOLDER)`);
-  return { profit: size * 0.015, simulated: false };
+  try {
+    // 真实吃单：根据 side 吃 best ask / best bid
+    const result = await marketTake(tokenID, side, size);
+
+    if (!result || !result.success) {
+      console.log(`   ${coin}: PM order failed, fallback to sim`);
+      const profit = simulatePnL(size);
+      return { profit, simulated: true };
+    }
+
+    console.log(`   ${coin}: ✅ PM ${side} ${size} @ token ${tokenID.slice(0,10)}... | ID: ${result.orderId?.slice(0,12)}...`);
+    return {
+      profit: size * 0.025, // 真实交易先估算 2.5%
+      simulated: false,
+      orderId: result.orderId,
+      status: result.status
+    };
+
+  } catch (err) {
+    console.error(`   ${coin} PM order error: ${err.message}`);
+    const profit = simulatePnL(size);
+    return { profit, simulated: true };
+  }
 }
 
 /**

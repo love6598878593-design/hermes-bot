@@ -1,65 +1,48 @@
 const axios = require("axios");
+const {
+  fetchAllMarkets,
+  resolveTokenID,
+  getOrderBook,
+  fetchAllTokenData
+} = require("./polymarket");
 
-// Polymarket CLOB API
-const POLYMARKET_API = "https://clob.polymarket.com";
-
-// 缓存上一次价格，用来算变化
+// 缓存上一次 Binance 价格，用来算变化
 const lastPrices = {};
-// 价格历史，用于计算真实波动率
-const priceHistory = {};
 
 /**
- * 获取 Binance 实时价格
- * Binance API 不需要代理，直接访问
+ * 获取 Polymarket 某个币的完整数据（tokenID + order book + 价格）
+ * 替代旧的假 API 调用
  */
-async function fetchBinancePrice(coin) {
+async function fetchPolymarketData(coin, markets) {
   try {
-    // HYPE 没有 USDT 交易对，跳过
-    if (coin === "HYPE") {
-      return null;
-    }
-    const symbol = coin + "USDT";
-    const res = await axios.get(`https://api.binance.com/api/v3/ticker/price`, {
-      params: { symbol },
-      timeout: 5000
-    });
-    return parseFloat(res.data.price);
-  } catch (err) {
-    console.error(`   ${coin} Binance error: ${err.message}`);
-    return null;
-  }
-}
+    const tokenInfo = resolveTokenID(markets, coin);
+    if (!tokenInfo) return null;
 
-/**
- * 获取 Polymarket 某个币的当前概率价格
- * 使用 CLOB API 的价差数据搜索活跃市场
- */
-async function fetchPolymarketPrice(coin) {
-  try {
-    // 搜索 Polymarket 市场 - 按币名关键词
-    const res = await axios.get(`${POLYMARKET_API}/price`, {
-      params: {
-        token: coin.toLowerCase(),
-        side: "BUY"
-      },
-      timeout: 10000
-    });
+    // 获取盘口
+    const book = await getOrderBook(tokenInfo.yesToken);
 
-    // API 可能返回价格数据或空
-    if (res.data && res.data.price !== undefined) {
-      return {
-        price: parseFloat(res.data.price) / 100, // 有些 API 返回的是基点
-        market: res.data.asset_id || coin,
-        question: `${coin} Up or Down?`
-      };
+    // 计算中间价（如果盘口有数据）
+    let midPrice = null;
+    if (book?.bestBid && book?.bestAsk) {
+      midPrice = (book.bestBid + book.bestAsk) / 2;
+    } else if (tokenInfo.outcomePrices) {
+      // 用 outcomePrices 做 fallback
+      const prices = Array.isArray(tokenInfo.outcomePrices)
+        ? tokenInfo.outcomePrices
+        : JSON.parse(tokenInfo.outcomePrices || "[]");
+      midPrice = parseFloat(prices[0] || "0.5");
     }
-    return null;
+
+    return {
+      price: midPrice,
+      market: tokenInfo.market,
+      conditionId: tokenInfo.conditionId,
+      yesToken: tokenInfo.yesToken,
+      noToken: tokenInfo.noToken,
+      book
+    };
   } catch (err) {
-    // Polymarket API 可能需要认证，fallback 到模拟数据
-    // 真实部署时需要配 API key
-    if (process.env.POLYMARKET_API_KEY) {
-      console.error(`   ${coin} PM API error: ${err.message}`);
-    }
+    console.error(`   ${coin} PM error: ${err.message}`);
     return null;
   }
 }
@@ -100,45 +83,68 @@ function calcRealVolatility(prices) {
 }
 
 /**
- * 更新所有市场数据
+ * 更新所有市场数据（真实 Polymarket + Binance）
+ *
+ * 数据流:
+ *   1. 从 Polymarket CLOB API 获取所有活跃市场
+ *   2. 自动解析每个币的 tokenID（关键词匹配）
+ *   3. 获取 order book（真实盘口）
+ *   4. 同时获取 Binance 价格 + K 线
+ *   5. 合并数据供策略引擎使用
  */
 async function updateMarketData(coins) {
   const data = {};
 
+  // 阶段 1: 批量获取 Polymarket 市场列表（共 1 次请求，缓存 5 分钟）
+  const markets = await fetchAllMarkets();
+
   for (const coin of coins) {
-    // 同时获取：当前价格 + 历史 K 线 + Polymarket
-    const [binancePrice, klines, pm] = await Promise.all([
+    // 同时抓取: Binance 价格 + K 线 + Polymarket 数据
+    const [binancePrice, klines] = await Promise.all([
       fetchBinancePrice(coin),
-      fetchBinanceKlines(coin),
-      fetchPolymarketPrice(coin)
+      fetchBinanceKlines(coin)
     ]);
 
-    // 计算价格变化
+    // 从 Polymarket 解析 token + order book
+    const pmData = await fetchPolymarketData(coin, markets);
+
+    // 计算币安价格变化
     let priceChange = 0;
     if (binancePrice && lastPrices[coin]) {
       priceChange = ((binancePrice - lastPrices[coin]) / lastPrices[coin]) * 100;
     }
 
-    // 计算真实波动率
+    // 计算真实波动率（基于 12 根 5-min K 线）
     const volatility = calcRealVolatility(klines);
 
-    // 缓存价格
+    // 缓存 Binance 价格
     if (binancePrice) {
       lastPrices[coin] = binancePrice;
     }
 
     data[coin] = {
       coin,
-      pmPrice: pm?.price ?? null,
-      pmMarket: pm?.market ?? null,
+      // Polymarket 数据
+      pmPrice: pmData?.price ?? null,
+      pmBid: pmData?.book?.bestBid ?? null,
+      pmAsk: pmData?.book?.bestAsk ?? null,
+      pmSpread: pmData?.book?.spread ?? null,
+      pmMarket: pmData?.market ?? null,
+      conditionId: pmData?.conditionId ?? null,
+      yesToken: pmData?.yesToken ?? null,
+      noToken: pmData?.noToken ?? null,
+      // Binance 数据
       binancePrice,
       priceChange,
       volatility,
-      success: !!(binancePrice || pm)
+      // 状态
+      success: !!(binancePrice || pmData),
+      hasPM: !!pmData,
+      hasBinance: !!binancePrice
     };
   }
 
   return data;
 }
 
-module.exports = { updateMarketData, fetchPolymarketPrice, fetchBinancePrice };
+module.exports = { updateMarketData, fetchBinancePrice, fetchBinanceKlines };

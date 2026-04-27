@@ -41,7 +41,7 @@ async function runBot() {
       }
 
       // 4. 执行交易
-      const result = await executeTrade(coin, signal);
+      const result = await executeTrade(coin, signal, marketData);
       if (result) {
         const pnl = result.profit || 0;
         cyclePnL += pnl;
