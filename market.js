@@ -48,41 +48,104 @@ async function fetchPolymarketData(coin, markets) {
 }
 
 /**
- * 获取 Binance 实时价格
+ * 获取币价（备用数据源）
+ * Binance 451 问题 → 用 CoinGecko + Kraken 双源
+ *
+ * 优先: CoinGecko (免费，无地区限制)
+ * 备选: Kraken
  */
-async function fetchBinancePrice(coin) {
+async function fetchCoinPrice(coin) {
+  // CoinGecko 币名映射
+  const COINGECKO_IDS = {
+    BTC: "bitcoin", ETH: "ethereum", SOL: "solana",
+    XRP: "ripple", DOGE: "dogecoin", HYPE: "hyperliquid",
+    BNB: "binancecoin"
+  };
+
+  const id = COINGECKO_IDS[coin];
+  if (!id) return null;
+
+  try {
+    // CoinGecko — 免费，不用 API key
+    const res = await axios.get(
+      `https://api.coingecko.com/api/v3/simple/price`,
+      {
+        params: { ids: id, vs_currencies: "usd" },
+        timeout: 8000
+      }
+    );
+    if (res.data?.[id]?.usd) {
+      return parseFloat(res.data[id].usd);
+    }
+  } catch (err) {
+    // CoinGecko 可能限流，走 Kraken
+  }
+
+  // 备选: Kraken API
+  try {
+    const krakenPairs = {
+      BTC: "XXBTZUSD", ETH: "XETHZUSD", SOL: "SOLUSD",
+      XRP: "XRPUSD", DOGE: "XDGUSD", BNB: "BNBUSD"
+    };
+    const pair = krakenPairs[coin];
+    if (pair) {
+      const res = await axios.get(
+        `https://api.kraken.com/0/public/Ticker?pair=${pair}`,
+        { timeout: 5000 }
+      );
+      const data = res.data?.result;
+      if (data) {
+        const key = Object.keys(data)[0];
+        if (key && data[key]?.c?.[0]) {
+          return parseFloat(data[key].c[0]);
+        }
+      }
+    }
+  } catch (err) {
+    // Kraken 也失败
+  }
+
+  // 最后备选: Binance (如果之前失败了)
   try {
     if (coin === "HYPE") return null;
-    const symbol = coin + "USDT";
     const res = await axios.get(`https://api.binance.com/api/v3/ticker/price`, {
-      params: { symbol },
-      timeout: 5000
+      params: { symbol: coin + "USDT" },
+      timeout: 3000
     });
     return parseFloat(res.data.price);
-  } catch (err) {
-    console.error(`   ${coin} Binance error: ${err.message}`);
+  } catch {
     return null;
   }
 }
 
 /**
- * 获取真实 Binance K 线数据（用于真实波动率计算）
+ * 获取 K 线数据（用 CoinGecko 替代 Binance）
  */
-async function fetchBinanceKlines(coin, interval = "5m", limit = 12) {
+async function fetchKlines(coin) {
+  const COINGECKO_IDS = {
+    BTC: "bitcoin", ETH: "ethereum", SOL: "solana",
+    XRP: "ripple", DOGE: "dogecoin", HYPE: "hyperliquid",
+    BNB: "binancecoin"
+  };
+
+  const id = COINGECKO_IDS[coin];
+  if (!id) return null;
+
   try {
-    if (coin === "HYPE") return null;
-    const symbol = coin + "USDT";
-    const res = await axios.get(`https://api.binance.com/api/v3/klines`, {
-      params: { symbol, interval, limit },
-      timeout: 5000
-    });
-    if (res.data && res.data.length > 1) {
-      // klines: [open_time, open, high, low, close, volume, ...]
-      const closes = res.data.map(k => parseFloat(k[4]));
-      return closes;
+    // CoinGecko OHLC: 返回 [timestamp, open, high, low, close]
+    const res = await axios.get(
+      `https://api.coingecko.com/api/v3/coins/${id}/ohlc`,
+      {
+        params: { vs_currency: "usd", days: "1" },
+        timeout: 8000
+      }
+    );
+    if (Array.isArray(res.data) && res.data.length > 1) {
+      // 取最后 12 根
+      return res.data.slice(-12).map(candle => candle[4]); // close price
     }
     return null;
-  } catch (err) {
+  } catch {
     return null;
   }
 }
