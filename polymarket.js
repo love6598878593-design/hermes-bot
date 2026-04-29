@@ -160,12 +160,13 @@ async function fetchPolymarkets() {
 }
 
 // ============================================================
-// 导出
+// 导出（fetchAllMarkets 是 fetchPolymarkets 的别名，兼容 server.js）
 // ============================================================
 module.exports = {
   sendNotification,
   resolveTokenID,
   resolveFromMatch,
   getMarketPrices,
-  fetchPolymarkets
+  fetchPolymarkets,
+  fetchAllMarkets: fetchPolymarkets
 };
