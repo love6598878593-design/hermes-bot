@@ -2,32 +2,29 @@ const fetch = require('node-fetch');
 const fs = require('fs');
 const path = require('path');
 
-// ==================== 加权币种映射 ====================
+// ==================== 精准币种映射 ====================
 const COIN_MAP = {
-  bitcoin:  ["btc",  "bitcoin"],
-  ethereum: ["eth",  "ethereum"],
-  solana:   ["sol", "solana"],
-  xrp:      ["xrp", "ripple"],
-  doge:     ["doge", "dogecoin"],
-  hype:     ["hype", "hyperliquid"],
-  bnb:      ["bnb",  "binance"]
+  bitcoin:  { include: ["bitcoin", "btc"], exclude: [] },
+  ethereum: { include: ["ethereum", " eth ", "-eth-", " eth/"], exclude: ["megaeth", "netherlands"] },
+  solana:   { include: ["solana", " sol ", "-sol-", " sol/"], exclude: ["solanke", "isolation", "console"] }
 };
 
-// 权重：全名 > 缩写
 const WEIGHTS = {
-  bitcoin: 5, btc: 3,
-  ethereum: 5, eth: 3,
-  solana: 5, sol: 3,
-  xrp: 5, ripple: 4,
-  dogecoin: 5, doge: 3,
-  hyperliquid: 5, hype: 3,
-  binance: 5, bnb: 3
+  bitcoin: 5, btc: 4,
+  ethereum: 5, eth: 4,
+  solana: 5, sol: 4
 };
 
-// ==================== 噪音过滤词 ====================
-const NOISE_WORDS = ["gta", "solanke", "football", "soccer", "movie", "album", "megaeth", "halving", "grammy", "president", "election"];
+const NOISE_WORDS = [
+  "gta", "solanke", "football", "soccer", "movie", "album",
+  "megaeth", "halving", "grammy", "president", "election",
+  "netherlands", "world cup", "nba", "nhl", "stanley",
+  "premier league", "champions league", "uefa", "fifa",
+  "senate", "congress", "impeach", "Oscars", "Grammy",
+  "reality show", "tv series", "celebrity"
+];
 
-// ==================== 带 TTL 的缓存 ====================
+// ==================== 缓存 ====================
 let marketCache = [];
 let cacheTimestamp = 0;
 const CACHE_TTL = 5 * 60 * 1000;
@@ -49,15 +46,13 @@ const savedTrade = loadTradeState();
 hasTraded = savedTrade.hasTraded || {};
 lastTradeTime = savedTrade.lastTradeTime || {};
 
-// ==================== 工具函数 ====================
+// ==================== 工具 ====================
 function safeJSON(x, fallback = []) {
   try {
     if (!x) return fallback;
     if (Array.isArray(x)) return x;
     return JSON.parse(x);
-  } catch {
-    return fallback;
-  }
+  } catch { return fallback; }
 }
 
 function normalizePrice(p) {
@@ -68,7 +63,7 @@ function normalizePrice(p) {
   return num;
 }
 
-// ==================== 通知 ====================
+// ==================== Telegram ====================
 async function sendNotification(msg) {
   const token = process.env.TELEGRAM_BOT_TOKEN;
   const cid   = process.env.TELEGRAM_CHAT_ID;
@@ -91,114 +86,68 @@ async function sendNotification(msg) {
 // ==================== CLOB Orderbook ====================
 async function getOrderBook(tokenId) {
   if (!tokenId) return null;
-
-  const url = `https://clob.polymarket.com/book?token_id=${tokenId}`;
-  console.log(`📡 getOrderBook: ${url}`);
-
   try {
-    const res = await fetch(url, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-      }
+    const res = await fetch(`https://clob.polymarket.com/book?token_id=${tokenId}`, {
+      headers: { 'User-Agent': 'Mozilla/5.0' }
     });
-
-    console.log(`📡 getOrderBook status: ${res.status}`);
-
-    if (!res.ok) {
-      console.error(`getOrderBook HTTP ${res.status}`);
-      return null;
-    }
-
-    const text = await res.text();
-
-    // 检测 HTML 响应（Cloudflare 拦截）
-    if (text.startsWith('<')) {
-      console.error('getOrderBook: 收到 HTML 响应 (Cloudflare 拦截)');
-      return null;
-    }
-
-    const data = JSON.parse(text);
-
-    const bestBid = data.bids?.[0]?.price || data.bestBid || null;
-    const bestAsk = data.asks?.[0]?.price || data.bestAsk || null;
-
-    if (!bestBid || !bestAsk) {
-      console.error('getOrderBook: 无有效 bid/ask');
-      return null;
-    }
-
-    console.log(`✅ Bid: ${bestBid}, Ask: ${bestAsk}`);
-    return { bestBid, bestAsk };
-
+    if (!res.ok) return null;
+    const data = await res.json();
+    return {
+      bestBid: data.bids?.[0]?.price || null,
+      bestAsk: data.asks?.[0]?.price || null
+    };
   } catch (e) {
-    console.error('getOrderBook error:', e.message);
     return null;
   }
 }
 
-// ==================== 余额查询 ====================
+// ==================== 余额（404 降级为离线模式） ====================
 async function getBalance() {
-  const privateKey = process.env.POLYMARKET_PRIVATE_KEY;
-  if (!privateKey) {
-    console.log("⚠️ 未设置 POLYMARKET_PRIVATE_KEY，返回模拟余额");
-    return { balance: "1.00", currency: "USDC" };
-  }
-
+  const pk = process.env.POLYMARKET_PRIVATE_KEY;
+  if (!pk) return { balance: "未设置私钥", currency: "USDC" };
   try {
     const res = await fetch("https://clob.polymarket.com/balance", {
       headers: {
-        "Authorization": `Bearer ${privateKey}`,
-        "Content-Type": "application/json"
+        "Authorization": `Bearer ${pk}`,
+        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0"
       }
     });
-
     if (!res.ok) {
-      console.error(`❌ 余额查询失败: HTTP ${res.status}`);
-      return { balance: "N/A", currency: "USDC" };
+      console.log(`⚠️ 余额接口 HTTP ${res.status}，使用离线模式`);
+      return { balance: "离线", currency: "USDC" };
     }
-
     const data = await res.json();
-    console.log(`💰 当前余额: $${data.balance || 'N/A'}`);
-    return { balance: data.balance || 'N/A', currency: 'USDC' };
+    return { balance: data.balance || data.usdcBalance || "N/A", currency: "USDC" };
   } catch (e) {
-    console.error("❌ 余额查询错误:", e.message);
-    return { balance: "Error", currency: "USDC" };
+    console.log("⚠️ 余额查询不可用，离线模式");
+    return { balance: "离线", currency: "USDC" };
   }
 }
 
 // ==================== 下单 ====================
 async function placeOrder(tokenId, side, size) {
   if (DRY_RUN) {
-    console.log(`🔸 [DRY RUN] ${side} $${size} → ${String(tokenId).slice(0,10)}...`);
-    await sendNotification(`🔸 *模拟下单*\n方向: ${side}\n金额: $${size}`);
+    console.log(`🔸 [DRY RUN] ${side} $${size}`);
     return { dryRun: true };
   }
-
   const pk = process.env.POLYMARKET_PRIVATE_KEY;
   if (!pk) throw new Error("缺少私钥");
-
   const res = await fetch("https://clob.polymarket.com/order", {
     method: "POST",
-    headers: {
-      "Authorization": `Bearer ${pk}`,
-      "Content-Type": "application/json"
-    },
+    headers: { "Authorization": `Bearer ${pk}`, "Content-Type": "application/json" },
     body: JSON.stringify({ token_id: tokenId, side, size, type: "market" })
   });
-
   const data = await res.json();
   if (!res.ok) throw new Error(data.message || "下单失败");
-
-  console.log(`💰 实盘下单: ${side} $${size}`);
-  await sendNotification(`💰 *实盘下单成功*\n方向: ${side}\n金额: $${size}`);
   return data;
 }
 
 // ==================== 安全交易 ====================
 async function safeTrade(coin, yesToken, noToken, currentProb) {
-  if (hasTraded[coin]) { console.log(`🔒 ${coin} 已交易过`); return null; }
-  if (Date.now() - (lastTradeTime[coin] || 0) < COOLDOWN) { console.log(`⏳ ${coin} 冷却中`); return null; }
-  if (currentProb == null || currentProb < 0.4 || currentProb > 0.6) { console.log(`⚠️ ${coin} 价格${currentProb?.toFixed(4)}不在安全区间`); return null; }
+  if (hasTraded[coin]) return null;
+  if (Date.now() - (lastTradeTime[coin] || 0) < COOLDOWN) return null;
+  if (currentProb == null || currentProb < 0.4 || currentProb > 0.6) return null;
   const side = currentProb >= 0.5 ? "yes" : "no";
   const token = side === "yes" ? yesToken : noToken;
   lastTradeTime[coin] = Date.now();
@@ -207,37 +156,43 @@ async function safeTrade(coin, yesToken, noToken, currentProb) {
   return await placeOrder(token, side, 1);
 }
 
-// ==================== 市场解析（纯净版，只返回 token） ====================
+// ==================== 市场解析 ====================
 function resolveMarket(markets, coin) {
-  const names = COIN_MAP[coin.toLowerCase()] || [coin.toLowerCase()];
+  const rules = COIN_MAP[coin.toLowerCase()];
+  if (!rules) return null;
 
-  let list;
-  if (markets && markets.length > 0) {
-    list = markets;
-  } else if (Date.now() - cacheTimestamp < CACHE_TTL) {
-    list = marketCache;
-  } else {
-    list = [];
-  }
+  const list = (markets && markets.length > 0) ? markets :
+    (Date.now() - cacheTimestamp < CACHE_TTL ? marketCache : []);
 
-  const scored = list
-    .map(m => {
-      const text = `${m.slug || ""} ${m.question || m.title || ""}`.toLowerCase();
-      let score = 0;
-      for (const n of names) {
-        if (text.includes(n)) score += (WEIGHTS[n] || 2);
-      }
-      if (NOISE_WORDS.some(w => text.includes(w))) score -= 5;
-      return { m, score };
-    })
-    .filter(x => x.score > 0)
-    .sort((a, b) => b.score - a.score);
+  let candidates = list.filter(m => {
+    const text = `${m.slug || ""} ${m.question || m.title || ""}`.toLowerCase();
+    return rules.include.some(k => text.includes(k));
+  });
 
-  if (!scored.length) return null;
+  candidates = candidates.filter(m => {
+    const text = `${m.slug || ""} ${m.question || m.title || ""}`.toLowerCase();
+    return !rules.exclude.some(e => text.includes(e));
+  });
+
+  candidates = candidates.filter(m => {
+    const text = `${m.slug || ""} ${m.question || m.title || ""}`.toLowerCase();
+    return !NOISE_WORDS.some(w => text.includes(w));
+  });
+
+  if (candidates.length === 0) return null;
+
+  const scored = candidates.map(m => {
+    const text = `${m.slug || ""} ${m.question || m.title || ""}`.toLowerCase();
+    let score = 0;
+    for (const k of rules.include) {
+      if (text.includes(k)) score += (WEIGHTS[coin.toLowerCase()] || 2);
+    }
+    if (/price|above|below|up\b|down\b/.test(text)) score += 3;
+    return { m, score };
+  }).sort((a, b) => b.score - a.score);
 
   const found = scored[0].m;
   const tokens = safeJSON(found.clobTokenIds || found.outcomes);
-
   if (!tokens || tokens.length < 2) return null;
 
   return {
@@ -251,9 +206,7 @@ function resolveMarket(markets, coin) {
 // ==================== 拉取全量市场 ====================
 async function fetchAllMarkets() {
   try {
-    const res = await fetch(
-      "https://gamma-api.polymarket.com/markets?limit=500&active=true&closed=false"
-    );
+    const res = await fetch("https://gamma-api.polymarket.com/markets?limit=500&active=true&closed=false");
     const data = await res.json();
     const active = (Array.isArray(data) ? data : []).filter(m => m.active && !m.closed);
     marketCache = active;
@@ -262,10 +215,7 @@ async function fetchAllMarkets() {
     return active;
   } catch(e) {
     console.error("fetchAllMarkets error:", e.message);
-    if (Date.now() - cacheTimestamp < CACHE_TTL) {
-      console.log("⚠️ 使用缓存数据");
-      return marketCache;
-    }
+    if (Date.now() - cacheTimestamp < CACHE_TTL) return marketCache;
     return [];
   }
 }
