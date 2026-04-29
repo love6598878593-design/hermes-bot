@@ -1,59 +1,58 @@
 require("dotenv").config();
 const express = require("express");
 const polymarket = require("./polymarket"); 
-const { getSignal } = require("./strategy");
-const { executeTrade, getTradeStats } = require("./exchange");
-const { checkRisk, recordPnL, resetCycleCounter, getRiskSummary } = require("./risk");
-const { updateMarketData } = require("./market");
+const { executeTrade } = require("./exchange");
+const { checkRisk, resetCycleCounter } = require("./risk");
+// 确保 strategy.js 存在且导出 getSignal
+const strategy = require("./strategy"); 
 
 const COINS = ["BTC", "ETH", "SOL", "XRP", "DOGE", "HYPE", "BNB"];
 let tradeCount = 0;
 let totalProfit = 0;
-let botStartTime = Date.now();
 
 const app = express();
 const PORT = process.env.PORT || 8080;
 
 app.get("/health", (req, res) => {
-  res.json({
-    status: "running",
-    uptime: Math.floor((Date.now() - botStartTime) / 1000),
-    cycles: tradeCount,
-    profit: totalProfit.toFixed(2)
-  });
+  res.json({ status: "running", cycles: tradeCount, profit: totalProfit.toFixed(2) });
 });
-
 app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
 
 async function runBot() {
   console.log(`\n[${new Date().toISOString()}] 🤖 Cycle #${++tradeCount}...`);
   try {
-    resetCycleCounter();
     const markets = await polymarket.fetchAllMarkets();
+    resetCycleCounter();
     
     for (const coin of COINS) {
-      const data = polymarket.resolveTokenID(markets, coin);
-      if (!data) {
+      try {
+        const data = polymarket.resolveTokenID(markets, coin);
+        if (!data) {
           console.log(`   ${coin}: Market not found`);
           continue;
-      }
-
-      const signal = await getSignal(coin, data);
-      if (signal && checkRisk(signal, totalProfit)) {
-        const result = await executeTrade(coin, signal, { [coin]: data });
-        if (result?.success) {
-          totalProfit += result.profit;
-          await polymarket.sendNotification(`✅ *交易成功*: ${coin} ${signal.action} +$${result.profit}`);
         }
+
+        // 统一传参结构
+        const signal = await strategy.getSignal(coin, data);
+        if (signal && checkRisk(signal, totalProfit)) {
+          const result = await executeTrade(coin, signal, { [coin]: data });
+          if (result?.success) {
+            totalProfit += (result.profit || 0);
+            await polymarket.sendNotification(`✅ *交易成功*: ${coin} ${signal.action} +$${result.profit}`);
+          }
+        }
+      } catch (coinErr) {
+        console.error(`   ❌ ${coin} 处理出错:`, coinErr.message);
       }
     }
   } catch (err) {
-    console.error(`❌ Cycle Error:`, err.message);
+    console.error(`❌ 全局循环错误:`, err.message);
   }
 }
 
-console.log("🚀 Hermes Bot starting...");
-polymarket.sendNotification("🟢 *Hermes Bot 已在 Railway 启动成功*");
+// 启动通知
+polymarket.sendNotification("🟢 *Hermes Bot 已启动*").catch(() => {});
 
-setInterval(runBot, process.env.TRADE_INTERVAL_MS || 60000);
+const interval = process.env.TRADE_INTERVAL_MS || 60000;
+setInterval(runBot, interval);
 runBot();
