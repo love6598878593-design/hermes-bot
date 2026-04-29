@@ -1,12 +1,10 @@
-/**
- * Polymarket 核心模块 - 全功能整合版
- * 修复: resolveTokenID 导出错误 & Telegram 变量诊断
- */
 const axios = require("axios");
 
-// ====== 环境变量自检 ======
+// ====== 环境变量自检逻辑 ======
 function getEnv(key) {
-    return process.env[key];
+    const val = process.env[key];
+    if (!val) console.warn(`⚠️  [Environment Warning]: 缺失变量 ${key}`);
+    return val;
 }
 
 // ====== 1. Telegram 发送逻辑 ======
@@ -15,8 +13,8 @@ async function sendNotification(message) {
   const chatId = getEnv("TELEGRAM_CHAT_ID");
 
   if (!token || !chatId) {
-    console.log(`❌ [Telegram Config Error]: Token或ChatID缺失`);
-    console.log("ℹ️ [Console Log]:", message);
+    console.log(`❌ [Telegram Config Error]: Token或ChatID缺失 (Token长度: ${token?.length || 0})`);
+    console.log("ℹ️ [Console Fallback]:", message);
     return;
   }
 
@@ -33,12 +31,13 @@ async function sendNotification(message) {
   }
 }
 
-// ====== 2. 市场数据抓取 ======
+// ====== 2. 市场解析逻辑 (修复 resolveTokenID) ======
 let cachedMarkets = null;
 async function fetchAllMarkets() {
   try {
     const res = await axios.get("https://clob.polymarket.com/markets", { timeout: 15000 });
     const data = res.data?.data || res.data || [];
+    console.log(`    📦 Polymarket: 成功解析 ${data.length} 个市场`);
     cachedMarkets = data;
     return data;
   } catch (err) {
@@ -47,44 +46,36 @@ async function fetchAllMarkets() {
   }
 }
 
-// ====== 3. 核心工具函数 (修复 resolveTokenID) ======
 function resolveTokenID(markets, coin) {
   if (!markets || !Array.isArray(markets)) return null;
-  
   const keywords = {
-    BTC: ["bitcoin", "btc"],
-    ETH: ["ethereum", "eth"],
-    SOL: ["solana", "sol"],
-    XRP: ["xrp", "ripple"],
-    DOGE: ["dogecoin", "doge"],
-    HYPE: ["hyperliquid", "hype"],
+    BTC: ["bitcoin", "btc"], ETH: ["ethereum", "eth"],
+    SOL: ["solana", "sol"], XRP: ["xrp", "ripple"],
+    DOGE: ["dogecoin", "doge"], HYPE: ["hyperliquid", "hype"],
     BNB: ["bnb", "binance"]
   };
-
   const kws = keywords[coin];
   if (!kws) return null;
 
-  // 寻找最匹配的价格预测市场
   const match = markets.find(m => {
     const title = (m.question || "").toLowerCase();
     return kws.some(kw => title.includes(kw)) && /price|above|below/.test(title);
   });
 
   if (!match) return null;
-
   const tokens = match.tokens || match.outcomes || [];
   return {
     market: match.question,
     yesToken: tokens[0]?.token_id || tokens[0]?.id,
-    noToken: tokens[1]?.token_id || tokens[1]?.id,
-    conditionId: match.conditionId
+    noToken: tokens[1]?.token_id || tokens[1]?.id
   };
 }
 
+// ====== 3. 盘口与执行 ======
 async function getOrderBook(tokenID) {
   if (!tokenID) return null;
   try {
-    const res = await axios.get(`https://clob.polymarket.com/book?token_id=${tokenID}`, { timeout: 8000 });
+    const res = await axios.get(`https://clob.polymarket.com/book?token_id=${tokenID}`);
     const b = res.data.bids || [];
     const a = res.data.asks || [];
     if (!b[0] || !a[0]) return null;
@@ -97,12 +88,10 @@ async function getOrderBook(tokenID) {
 }
 
 async function marketTake(tokenID, side, size) {
-    // 这是一个占位，实际下单逻辑应调用 CLOB SDK
-    console.log(`执行下单: ${side} ${tokenID} Amount: ${size}`);
-    return { success: true, orderId: "sim-order-" + Date.now() };
+    console.log(`执行下单: ${side} ${tokenID} $${size}`);
+    return { success: true, orderId: "sim-" + Date.now() };
 }
 
-// ====== 4. 导出所有模块 ======
 module.exports = {
   fetchAllMarkets,
   sendNotification,
