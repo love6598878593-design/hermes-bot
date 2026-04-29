@@ -1,9 +1,18 @@
 /**
- * 交易所执行层
- * 对接 Polymarket CLOB API（通过 polymarket.js） + Binance API
+ * 交易所执行层 - 余额增强版
+ * 对接地址: 0x2e83745069DBf93336d4Ea268A33e8f5B6d56BFA
  */
 
+const { ethers } = require("ethers");
 const { getOrderBook, placeLimitOrder, marketTake } = require("./polymarket");
+
+// --- 节点与合约配置 ---
+const RPC_URL = "https://polygon-rpc.com";
+const WALLET_ADDRESS = "0x2e83745069DBf93336d4Ea268A33e8f5B6d56BFA";
+const USDC_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"; 
+const USDC_ABI = ["function balanceOf(address owner) view returns (uint256)"];
+
+const provider = new ethers.JsonRpcProvider(RPC_URL);
 
 /** 交易统计 */
 const tradeStats = {
@@ -14,10 +23,32 @@ const tradeStats = {
   real: 0
 };
 
+// ====== 1. 余额查询逻辑 ======
+/**
+ * 获取实时余额 (USDC 和 MATIC)
+ */
+async function getWalletBalance() {
+    try {
+        // 查询 USDC (6位小数)
+        const usdcContract = new ethers.Contract(USDC_ADDRESS, USDC_ABI, provider);
+        const usdcRaw = await usdcContract.balanceOf(WALLET_ADDRESS);
+        const usdcBalance = parseFloat(ethers.formatUnits(usdcRaw, 6)).toFixed(2);
+
+        // 查询 MATIC (Gas 费)
+        const maticRaw = await provider.getBalance(WALLET_ADDRESS);
+        const maticBalance = parseFloat(ethers.formatEther(maticRaw)).toFixed(4);
+
+        return { usdc: usdcBalance, matic: maticBalance };
+    } catch (e) {
+        console.error("   ❌ 余额查询失败:", e.message);
+        return { usdc: "0.00", matic: "0.00" };
+    }
+}
+
+// ====== 2. 交易执行逻辑 ======
 /**
  * 执行交易
  * 根据 action 类型路由到对应交易所
- * 自动使用 marketData 中的 tokenID 进行 Polymarket 下单
  */
 async function executeTrade(coin, signal, marketData) {
   try {
@@ -36,7 +67,7 @@ async function executeTrade(coin, signal, marketData) {
       case "VOLATILITY":
       case "TREND_UP":
       case "TREND_DOWN":
-        // 趋势/波动率交易 → 走模拟（后续可接入 Binance）
+        // 趋势/波动率交易 → 走模拟
         result = await simulateExecution(coin, signal);
         break;
       default:
@@ -64,24 +95,23 @@ async function executeTrade(coin, signal, marketData) {
 
 /**
  * Polymarket 真实下单
- * 走 CLOB API，自动吃单价成交
- *
- * 需要环境变量:
- *   POLYMARKET_PRIVATE_KEY — Polygon 钱包私钥（用于签名）
- *   POLYMARKET_API_KEY — CLOB API key（可选）
- *
- * 如果没有配 key → 模拟交易
  */
 async function placePolymarketOrder(coin, side, size, tokenID) {
   if (!process.env.POLYMARKET_PRIVATE_KEY || !tokenID) {
-    // 没配 Key → 模拟
     const profit = simulatePnL(size);
     console.log(`   ${coin}: ⚠️ No PM key or tokenID → simulated $${profit.toFixed(2)}`);
     return { profit, simulated: true };
   }
 
   try {
-    // 真实吃单：根据 side 吃 best ask / best bid
+    // 检查余额是否支持下单
+    const balances = await getWalletBalance();
+    if (parseFloat(balances.usdc) < size) {
+        console.log(`   ${coin}: ❌ 余额不足 (${balances.usdc} USDC), 跳过真实下单`);
+        return { profit: 0, simulated: true, error: "Insufficient Balance" };
+    }
+
+    // 真实吃单
     const result = await marketTake(tokenID, side, size);
 
     if (!result || !result.success) {
@@ -90,12 +120,12 @@ async function placePolymarketOrder(coin, side, size, tokenID) {
       return { profit, simulated: true };
     }
 
-    console.log(`   ${coin}: ✅ PM ${side} ${size} @ token ${tokenID.slice(0,10)}... | ID: ${result.orderId?.slice(0,12)}...`);
+    console.log(`   ${coin}: ✅ PM ${side} ${size} @ token ${tokenID.slice(0,10)}...`);
     return {
-      profit: size * 0.025, // 真实交易先估算 2.5%
+      success: true,
+      profit: size * 0.025, 
       simulated: false,
-      orderId: result.orderId,
-      status: result.status
+      orderId: result.orderId
     };
 
   } catch (err) {
@@ -106,30 +136,28 @@ async function placePolymarketOrder(coin, side, size, tokenID) {
 }
 
 /**
- * 模拟执行（趋势/波动率）
+ * 模拟执行与收益计算
  */
 async function simulateExecution(coin, signal) {
   const profit = simulatePnL(signal.size);
   return { profit, simulated: true };
 }
 
-/**
- * 模拟 PnL 计算
- * 55% 胜率，平均赢 +2.5%，平均输 -1.5%
- */
 function simulatePnL(size) {
   const win = Math.random() < 0.55;
   const pnlPercent = win
-    ? (1.5 + Math.random() * 2.5) / 100   // +1.5% ~ +4%
-    : -(1 + Math.random() * 2) / 100;     // -1% ~ -3%
+    ? (1.5 + Math.random() * 2.5) / 100 
+    : -(1 + Math.random() * 2) / 100;
   return +(size * pnlPercent).toFixed(2);
 }
 
-/**
- * 获取交易统计
- */
 function getTradeStats() {
-  return { ...tradeStats, winRate: tradeStats.total > 0 ? (tradeStats.wins / tradeStats.total * 100).toFixed(1) + '%' : '0%' };
+    return tradeStats;
 }
 
-module.exports = { executeTrade, getTradeStats };
+module.exports = {
+  executeTrade,
+  getTradeStats,
+  getWalletBalance,
+  WALLET_ADDRESS
+};
