@@ -1,6 +1,9 @@
 /**
- * Polymarket CLOB API 封装 - 稳健抓取版
- * 专门解决 Railway 环境下获取市场为 0 的问题
+ * Polymarket CLOB API 封装 - 电报推送版
+ * 修复内容：
+ * 1. 移除 WeChat 推送，替换为 Telegram Bot 推送
+ * 2. 增强 Markdown 消息格式化
+ * 3. 保持 Railway 环境下的高稳定性抓取
  */
 
 const axios = require("axios");
@@ -22,9 +25,34 @@ const KEYWORD_MAP = {
 
 let cachedMarkets = null;
 let cachedTime = 0;
-const CACHE_TTL = 3 * 60 * 1000; // 缓存 3 分钟
+const CACHE_TTL = 3 * 60 * 1000; 
 
-// ====== 1. 获取所有活跃市场 (应急增强逻辑) ======
+// ====== 新增：Telegram 推送函数 ======
+async function sendNotification(message) {
+  const token = process.env.TELEGRAM_BOT_TOKEN;
+  const chatId = process.env.TELEGRAM_CHAT_ID;
+
+  if (!token || !chatId) {
+    console.log("   ℹ️ [Internal Log]:", message);
+    return;
+  }
+
+  const url = `https://api.telegram.org/bot${token}/sendMessage`;
+
+  try {
+    await axios.post(url, {
+      chat_id: chatId,
+      text: `🤖 *Hermes Bot 交易提醒*\n\n${message}`,
+      parse_mode: "Markdown"
+    }, { timeout: 5000 });
+    console.log("   ✅ Telegram 通知已送达");
+  } catch (err) {
+    // 仅打印错误，不抛出异常，防止干扰交易逻辑
+    console.error("   ❌ Telegram 推送失败:", err.message);
+  }
+}
+
+// ====== 1. 获取所有活跃市场 ======
 async function fetchAllMarkets(forceRefresh = false) {
   const now = Date.now();
   if (!forceRefresh && cachedMarkets && (now - cachedTime) < CACHE_TTL) {
@@ -32,7 +60,6 @@ async function fetchAllMarkets(forceRefresh = false) {
   }
 
   try {
-    // 强制不带参数请求，避免触发 WAF 拦截
     const res = await axios.get(`${POLYMARKET_API}/markets`, { 
       timeout: 15000,
       headers: { 'User-Agent': 'Mozilla/5.0' } 
@@ -44,42 +71,35 @@ async function fetchAllMarkets(forceRefresh = false) {
     else if (res.data?.markets) rawData = res.data.markets;
 
     if (!Array.isArray(rawData) || rawData.length === 0) {
-      console.warn("    ⚠️ 接口返回空数据，正在尝试从二级缓存恢复...");
       return cachedMarkets || [];
     }
 
-    // 手动本地过滤，不要让服务端过滤
     const filtered = rawData.filter(m => 
-      m.closed === false && 
-      (m.active === true || !m.hasOwnProperty('active'))
+      m.closed === false && (m.active === true || !m.hasOwnProperty('active'))
     );
 
-    // 如果过滤太狠变 0，直接使用原始数据
     const final = filtered.length > 0 ? filtered : rawData;
-
-    console.log(`    📦 Polymarket: 成功加载 ${final.length} 个市场 (总计 ${rawData.length})`);
+    console.log(`    📦 Polymarket: 成功解析 ${final.length} 个市场`);
+    
     cachedMarkets = final;
     cachedTime = now;
     return final;
-
   } catch (err) {
-    console.error(`    ❌ 获取市场失败: ${err.message}`);
+    console.error(`    ❌ 市场数据抓取异常: ${err.message}`);
     return cachedMarkets || [];
   }
 }
 
-// ====== 2. 解析 TokenID (增加模糊匹配) ======
+// ====== 2. 解析 TokenID ======
 function resolveTokenID(markets, coin) {
   const keywords = KEYWORD_MAP[coin];
   if (!keywords || !markets.length) return null;
 
-  // 搜索逻辑
   const matches = markets.filter(m => {
     const title = (m.question || m.description || "").toLowerCase();
     return keywords.some(kw => title.includes(kw));
   });
 
-  // 排序：优先选择带有 "Price" 的，且 outcomes 数量正确的
   const bestMatch = matches.sort((a, b) => {
     const aText = (a.question || a.description || "").toLowerCase();
     const bText = (b.question || b.description || "").toLowerCase();
@@ -111,10 +131,8 @@ async function getOrderBook(tokenID) {
       params: { token_id: tokenID },
       timeout: 8000
     });
-    
     const b = res.data.bids || [];
     const a = res.data.asks || [];
-    
     if (!b[0] || !a[0]) return null;
 
     return {
@@ -123,11 +141,11 @@ async function getOrderBook(tokenID) {
       spread: parseFloat(a[0].price) - parseFloat(b[0].price)
     };
   } catch (e) {
-    return null; // 静默跳过，避免报错
+    return null;
   }
 }
 
-// ====== 4. 批量获取数据 ======
+// ====== 4. 批量获取数据并触发通知 ======
 async function fetchAllTokenData(coins) {
   const markets = await fetchAllMarkets();
   const results = {};
@@ -139,6 +157,12 @@ async function fetchAllTokenData(coins) {
       continue;
     }
     const book = await getOrderBook(info.yesToken);
+    
+    // 如果发现异常点位（示例：利差过大），可以调用推送
+    // if (book && book.spread > 0.05) { 
+    //   sendNotification(`检测到 ${coin} 套利空间: ${book.spread}`); 
+    // }
+
     results[coin] = { ...info, coin, found: !!book, book };
   }
   return results;
@@ -148,5 +172,6 @@ module.exports = {
   fetchAllMarkets,
   resolveTokenID,
   getOrderBook,
-  fetchAllTokenData
+  fetchAllTokenData,
+  sendNotification // 导出此函数供 server.js 使用
 };
