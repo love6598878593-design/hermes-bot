@@ -1,178 +1,145 @@
 require("dotenv").config();
 const express = require("express");
-const fetch = require("node-fetch");
 const { getSignal } = require("./strategy");
 const { executeTrade, getTradeStats } = require("./exchange");
 const { checkRisk, recordPnL, resetCycleCounter, getRiskSummary } = require("./risk");
 const { updateMarketData } = require("./market");
+const polymarket = require("./polymarket"); // 引入我们修改后的 polymarket.js
 
 // =========================
-//   🔥 基础状态
+//    🔥 基础状态
 // =========================
 const COINS = ["BTC", "ETH", "SOL", "XRP", "DOGE", "HYPE", "BNB"];
 let marketData = {};
 let tradeCount = 0;
-let cyclePnL = 0;
 let totalProfit = 0;
 let botStartTime = Date.now();
 let isRunning = true;
 let lastHeartbeat = Date.now();
 
 // =========================
-//   🔔 微信通知
-// =========================
-const WECHAT_WEBHOOK = process.env.WECHAT_WEBHOOK;
-async function notify(msg) {
-  if (!WECHAT_WEBHOOK) return;
-  try {
-    await fetch(WECHAT_WEBHOOK, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ msgtype: "text", text: { content: `[HermesBot] ${msg}` } })
-    });
-  } catch (e) {
-    console.error("WeChat notify failed:", e.message);
-  }
-}
-
-// =========================
-//   ⏱ sleep 工具
-// =========================
-function sleep(ms) {
-  return new Promise(r => setTimeout(r, ms));
-}
-
-// =========================
-//   🚀 Express 服务
+//    🚀 Express 服务
 // =========================
 const app = express();
 app.use(express.json());
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 8080; // Railway 通常使用 8080
 
-// ❤️ health check
+// ❤️ Health Check 接口
 app.get("/health", (req, res) => {
   res.json({
     status: isRunning ? "ok" : "stopped",
     uptime: Math.floor((Date.now() - botStartTime) / 1000),
     timestamp: new Date().toISOString(),
-    lastHeartbeat,
     cycles: tradeCount,
-    profit: totalProfit,
-    trades: getTradeStats(),
+    profit: totalProfit.toFixed(2),
     risk: getRiskSummary()
   });
 });
 
-// 📲 微信控制接口
-app.post("/wechat", async (req, res) => {
-  const msg = req.body.text?.content || "";
-
-  if (msg === "/status") {
-    return res.json({
-      reply: `🧠 Hermes运行中\n⏱ uptime: ${Math.floor((Date.now() - botStartTime) / 1000)}s\n💰 PnL: $${totalProfit.toFixed(2)}\n📊 trades: ${tradeCount}`
-    });
-  }
-  if (msg === "/stop") {
-    isRunning = false;
-    await notify("⛔ Hermes 已停止交易");
-  }
-  if (msg === "/start") {
-    isRunning = true;
-    await notify("🚀 Hermes 已恢复运行");
-  }
-  if (msg === "/pnl") {
-    return res.json({ reply: `💰 PnL: $${totalProfit.toFixed(2)}, trades: ${tradeCount}` });
-  }
-
-  res.json({ reply: "OK" });
-});
-
 app.listen(PORT, () => {
-  console.log(`🚀 Hermes running on port ${PORT}`);
+  console.log(`🚀 Hermes Server running on port ${PORT}`);
 });
 
 // =========================
-//   🔥 交易主循环
+//    🔥 交易主循环
 // =========================
 async function runBot() {
   if (!isRunning) return;
 
-  cyclePnL = 0;
+  let cyclePnL = 0;
   console.log(`\n[${new Date().toISOString()}] 🤖 Cycle #${++tradeCount}...`);
 
   try {
-    // 1. 重置 cycle 计数器
+    // 1. 重置 cycle 风险计数
     resetCycleCounter();
 
-    // 2. 获取市场数据
+    // 2. 获取市场数据 (这里会触发 polymarket.js 中的 1000 个市场抓取)
     marketData = await updateMarketData(COINS);
-    console.log(`   Market: ${Object.keys(marketData).length} coins loaded`);
-
-    // 3. 对每个币生成信号
+    
+    // 3. 对每个币种生成信号并执行
     for (const coin of COINS) {
       const data = marketData[coin];
-      if (!data) continue;
+      if (!data || !data.found) continue;
 
       const signal = await getSignal(coin, data, marketData);
+      
       if (!signal) {
         console.log(`   ${coin}: No signal`);
         continue;
       }
 
+      // 4. 风险检查
       const allowed = checkRisk(signal, totalProfit);
       if (!allowed) {
         console.log(`   ${coin}: ⛔ Risk blocked`);
         continue;
       }
 
+      // 5. 执行交易
       const result = await executeTrade(coin, signal, marketData);
-      if (result) {
+      if (result && result.success) {
         const pnl = result.profit || 0;
         cyclePnL += pnl;
         totalProfit += pnl;
         recordPnL(pnl);
-        console.log(`   ${coin}: ✅ ${signal.action} $${signal.size} | PnL: $${pnl.toFixed(2)}`);
+        
+        console.log(`   ${coin}: ✅ ${signal.action} Success | PnL: $${pnl.toFixed(4)}`);
+        
+        // 实时推送交易成功到 Telegram
+        await polymarket.sendNotification(
+          `✅ *交易执行成功*\n` +
+          `• 币种: ${coin}\n` +
+          `• 动作: ${signal.action}\n` +
+          `• 收益: $${pnl.toFixed(4)}\n` +
+          `• 累计总额: $${totalProfit.toFixed(2)}`
+        );
       }
     }
 
-    console.log(`   Cycle PnL: $${cyclePnL.toFixed(2)} | Total: $${totalProfit.toFixed(2)}`);
-    console.log(`   ${JSON.stringify(getRiskSummary())}`);
+    console.log(`   Cycle PnL: $${cyclePnL.toFixed(4)} | Total: $${totalProfit.toFixed(4)}`);
 
   } catch (err) {
-    console.error(`   ❌ Error:`, err.message);
-    await notify(`❌ Cycle error: ${err.message}`);
+    console.error(`   ❌ Cycle Error:`, err.message);
+    // 发生严重错误时推送 TG
+    await polymarket.sendNotification(`🚨 *运行异常*: ${err.message}`);
   }
 }
 
 // =========================
-//   💓 心跳（防假死）
+//    💓 心跳 (每分钟打印)
 // =========================
 setInterval(() => {
   lastHeartbeat = Date.now();
-  console.log(`💓 HEARTBEAT | uptime: ${Math.floor((Date.now() - botStartTime) / 1000)}s | trades: ${tradeCount} | PnL: $${totalProfit.toFixed(2)}`);
+  const uptime = Math.floor((Date.now() - botStartTime) / 1000);
+  console.log(`💓 HEARTBEAT | uptime: ${uptime}s | trades: ${tradeCount} | PnL: $${totalProfit.toFixed(2)}`);
 }, 60 * 1000);
 
 // =========================
-//   🚨 崩溃保护
+//    🚨 崩溃保护
 // =========================
 process.on("uncaughtException", async (err) => {
   console.error("💥 UNCAUGHT:", err);
-  await notify(`🚨 Hermes崩溃: ${err.message}`);
-  process.exit(1);
+  await polymarket.sendNotification(`💥 *程序崩溃 (Uncaught)*: ${err.message}`);
+  setTimeout(() => process.exit(1), 1000);
 });
 
 process.on("unhandledRejection", async (err) => {
   console.error("💥 UNHANDLED REJECTION:", err);
-  await notify(`🚨 Promise错误: ${err}`);
+  await polymarket.sendNotification(`💥 *Promise 拒绝错误*: ${err.message || err}`);
 });
 
 // =========================
-//   🚀 启动
+//    🚀 启动逻辑
 // =========================
+const interval = parseInt(process.env.TRADE_INTERVAL_MS || "60000");
+
 console.log("🚀 Hermes Bot starting...");
 console.log(`   Coins: ${COINS.join(", ")}`);
-console.log(`   Interval: ${process.env.TRADE_INTERVAL_MS || 20000}ms`);
+console.log(`   Interval: ${interval}ms`);
 
+// 启动后立即推送一条 TG 消息确认链路通畅
+polymarket.sendNotification("🟢 *Hermes Bot 已在 Railway 启动成功*\n正在监听 Polymarket 套利机会...");
+
+// 立即运行一次，随后进入定时循环
 runBot();
-setInterval(runBot, parseInt(process.env.TRADE_INTERVAL_MS || "20000"));
-notify("🟢 Hermes 已启动");
+setInterval(runBot, interval);
