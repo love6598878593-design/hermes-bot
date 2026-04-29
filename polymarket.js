@@ -33,51 +33,56 @@ function resolveTokenID(markets, coin) {
   if (!markets || !Array.isArray(markets)) return null;
   const names = COIN_MAP[coin.toLowerCase()] || [coin.toLowerCase()];
 
-  // ✅ 全文语义匹配（question + slug + description）
   const match = markets.find(m => {
     const text = [
-      m.question, m.title, m.slug, m.eventSlug, m.description
+      m.title, m.question, m.slug, m.eventSlug, m.description
     ].filter(Boolean).join(" ").toLowerCase();
-
     return names.some(n => text.includes(n));
   });
 
   if (!match) return null;
 
-  let tokens = match.tokens || match.outcomes || [];
+  // ✅ 新接口返回 clobTokenIds 或 outcomes
+  let tokens = match.clobTokenIds || match.outcomes || [];
   if (!Array.isArray(tokens)) tokens = Object.values(tokens);
-  if (tokens.length < 2) {
-    console.warn(`⚠️ ${coin} 匹配到市场但无足够 outcomes`);
-    return null;
-  }
-
-  const yesId = tokens[0]?.token_id || tokens[0]?.id || tokens[0]?.tokenId;
-  const noId  = tokens[1]?.token_id || tokens[1]?.id || tokens[1]?.tokenId;
+  
+  // ✅ 过滤出 Yes/No（有时是字符串数组）
+  const yes = tokens.find(t => {
+    const s = (typeof t === "string" ? t : (t.outcome || t.label || "")).toLowerCase();
+    return s === "yes" || s === "up";
+  });
+  const no = tokens.find(t => {
+    const s = (typeof t === "string" ? t : (t.outcome || t.label || "")).toLowerCase();
+    return s === "no" || s === "down";
+  });
 
   return {
-    market: match.question || match.title || match.slug,
-    yesToken: yesId,
-    noToken: noId
+    market: match.title || match.question || match.slug,
+    yesToken: typeof yes === "string" ? yes : (yes?.token_id || yes?.id || yes?.tokenId),
+    noToken:  typeof no  === "string" ? no  : (no?.token_id  || no?.id  || no?.tokenId),
+    rawTokens: tokens.slice(0, 4)  // 调试用
   };
 }
 
-// ======================= Fetch markets =======================
+// ======================= Fetch markets（换接口） =======================
 async function fetchAllMarkets() {
   try {
-    const res = await fetch("https://gamma-api.polymarket.com/events?limit=500&active=true&closed=false");
+    // ✅ 换用 /markets 接口（返回完整 token 数据）
+    const res = await fetch(
+      "https://gamma-api.polymarket.com/markets?limit=500&active=true&closed=false"
+    );
     const data = await res.json();
-
-    // ✅ 只保留活跃市场
     const active = (Array.isArray(data) ? data : []).filter(m => m.active && !m.closed);
 
     console.log(`📦 Polymarket: ${active.length} 个活跃市场`);
 
-    // ✅ 打印前 10 个市场（看清真实结构）
-    active.slice(0, 10).forEach(m => {
+    // ✅ 打印前 5 个，看清新结构
+    active.slice(0, 5).forEach(m => {
       console.log({
-        question: m.question,
+        title: m.title || m.question,
         slug: m.slug,
-        outcomes: (m.outcomes || []).slice(0, 2)
+        outcomes: (m.outcomes || []).slice(0, 2),
+        clobTokenIds: (m.clobTokenIds || []).slice(0, 2)
       });
     });
 
@@ -88,14 +93,18 @@ async function fetchAllMarkets() {
   }
 }
 
-// ======================= Get prices for coins =======================
+// ======================= Get prices =======================
 async function getMarketPrices(markets) {
   const coins = ["BTC", "ETH", "SOL", "XRP", "DOGE", "HYPE", "BNB"];
   const res = {};
   for (const c of coins) {
     const r = resolveTokenID(markets, c);
-    if (r) { console.log(`✅ ${c}: ${r.market}`); res[c] = r; }
-    else   { console.log(`❌ ${c}: Market not found`); }
+    if (r) {
+      console.log(`✅ ${c}: ${r.market} | tokens: ${JSON.stringify(r.rawTokens)}`);
+      res[c] = r;
+    } else {
+      console.log(`❌ ${c}: Market not found`);
+    }
   }
   return res;
 }
