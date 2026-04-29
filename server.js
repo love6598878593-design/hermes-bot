@@ -1,35 +1,143 @@
-  const newRegime = classifyRegime(zVol, momentum);
+require('dotenv').config();
 
-  // ✅ Regime 稳定窗口
+const LOCK_FILE = '/tmp/hermes.lock';
+const fs = require('fs');
+try {
+  const pid = fs.readFileSync(LOCK_FILE, 'utf8');
+  console.log(`⚠️ 已有实例 (PID: ${pid})，退出`);
+  process.exit(0);
+} catch (e) {
+  fs.writeFileSync(LOCK_FILE, String(process.pid));
+}
+process.on('exit', () => { try { fs.unlinkSync(LOCK_FILE); } catch(e) {} });
+process.on('SIGTERM', () => { try { fs.unlinkSync(LOCK_FILE); } catch(e) {} process.exit(0); });
+
+const {
+  sendNotification,
+  getOrderBook,
+  resolveMarket,
+  fetchAllMarkets,
+  getBalance,
+  safeTrade,
+  normalizePrice
+} = require('./polymarket');
+
+const CONFIG = {
+  INTERVAL: 30_000,
+  AI_COOLDOWN: 5 * 60 * 1000,
+  MIN_VOL: 1e-6,
+  COINS: ['bitcoin', 'ethereum', 'solana'],
+  DEAD_ZONE: 0.002,
+  REGIME_STABILITY_TICKS: 2,
+  REGIME_STABILITY_MS: 60_000,
+  VOL_DECAY: 0.9
+};
+
+// ==================== 指数衰减波动率估计器 ====================
+let volEstimator = {};
+for (const c of CONFIG.COINS) {
+  volEstimator[c] = { mean: 0.01, std: 0.005 };
+}
+
+function updateVolEstimator(coin, absVol) {
+  const v = volEstimator[coin];
+  const dev = Math.abs(absVol - v.mean);
+  v.mean = CONFIG.VOL_DECAY * v.mean + (1 - CONFIG.VOL_DECAY) * absVol;
+  v.std  = CONFIG.VOL_DECAY * v.std  + (1 - CONFIG.VOL_DECAY) * dev;
+  return (absVol - v.mean) / (v.std + 1e-6);
+}
+
+// ==================== 状态机 ====================
+let state = {};
+for (const c of CONFIG.COINS) {
+  state[c] = {
+    emaShort: null,
+    emaLong: null,
+    momentum: 0,
+    absVolatility: 0,
+    zVolatility: 0,
+    regime: 'INIT',
+    regimeStableCount: 0,
+    regimeLastChange: 0,
+    signalStrength: 0,
+    lastDecisionTime: 0
+  };
+}
+
+function aiThreshold(zVol) {
+  const absZ = Math.abs(zVol);
+  return 0.12 + absZ * 0.6;
+}
+
+function classifyRegime(zVol, momentum) {
+  if (zVol < -0.5) return 'LOW_VOL';
+  if (Math.abs(momentum) > 0.004) return 'TREND';
+  return 'CHOP';
+}
+
+function updateV5Core(coin, currentProb) {
+  const s = state[coin];
+
+  if (s.emaShort === null) {
+    s.emaShort = currentProb;
+    s.emaLong = currentProb;
+    s.zVolatility = 0;
+    s.regime = 'INIT';
+    return { signalStrength: 0, momentum: 0, regime: 'INIT', zVol: 0, shouldAI: false };
+  }
+
+  const instantVol = Math.abs(currentProb - s.emaShort);
+  const alpha = 0.4 / (1 + instantVol * 15);
+
+  s.emaShort = (currentProb * alpha) + (s.emaShort * (1 - alpha));
+  s.emaLong  = (currentProb * (alpha * 0.4)) + (s.emaLong * (1 - alpha * 0.4));
+
+  let momentum = s.emaShort - s.emaLong;
+  if (Math.abs(momentum) < CONFIG.DEAD_ZONE) momentum = 0;
+  s.momentum = momentum;
+
+  s.absVolatility = (instantVol * 0.1) + (s.absVolatility * 0.9);
+
+  const zVol = updateVolEstimator(coin, s.absVolatility);
+  s.zVolatility = zVol;
+
+  const newRegime = classifyRegime(zVol, momentum);
+  const now = Date.now();
+
   if (newRegime === s.regime) {
     s.regimeStableCount++;
   } else {
     s.regime = newRegime;
     s.regimeStableCount = 0;
-    s.regimeLastChange = Date.now();
+    s.regimeLastChange = now;
   }
 
-  // ✅ 结构性变化检测
+  const stableTime = now - s.regimeLastChange;
+  const isStable = s.regimeStableCount >= CONFIG.REGIME_STABILITY_TICKS ||
+                   stableTime > CONFIG.REGIME_STABILITY_MS;
+
   const structuralShift =
     (newRegime === 'TREND' && s.regimeStableCount === 0) ||
     Math.abs(momentum) > CONFIG.DEAD_ZONE * 2;
 
-  // ✅ 信号强度
-  const signalStrength = zVol > 0 ? Math.abs(momentum) / (zVol + 0.001) : 0;
+  const signalStrength = Math.abs(momentum) / (Math.abs(zVol) + 0.001);
   s.signalStrength = signalStrength;
 
-  const threshold = aiThreshold(Math.abs(zVol));
+  const threshold = aiThreshold(zVol);
 
-  // ✅ AI 门控：结构性变化 + 信号超阈值 + regime 稳定 + 非 CHOP
+  // ✅ 主触发 + 辅约束 + 高信号 override
+  const baseTrigger = structuralShift;
+  const gatedTrigger = signalStrength > threshold && isStable;
+  const highSignalOverride = signalStrength > 0.35;
+
   const shouldAI =
-    structuralShift &&
-    signalStrength > threshold &&
-    s.regimeStableCount >= CONFIG.REGIME_STABILITY_TICKS &&
+    baseTrigger &&
+    (gatedTrigger || highSignalOverride) &&
     s.regime !== 'CHOP' &&
     currentProb > 0.1 && currentProb < 0.9 &&
-    (Date.now() - s.lastDecisionTime > CONFIG.AI_COOLDOWN);
+    (now - s.lastDecisionTime > CONFIG.AI_COOLDOWN);
 
-  if (shouldAI) s.lastDecisionTime = Date.now();
+  if (shouldAI) s.lastDecisionTime = now;
 
   return { signalStrength, momentum, regime: s.regime, zVol, shouldAI };
 }
@@ -39,7 +147,7 @@ let mainInterval = null;
 
 async function main() {
   if (mainInterval) clearInterval(mainInterval);
-  console.log('🤖 Hermes V5 Production Stable 启动 (单实例)\n');
+  console.log('🤖 Hermes V5 Final 启动 (单实例)\n');
 
   const balance = await getBalance();
   if (balance) {
