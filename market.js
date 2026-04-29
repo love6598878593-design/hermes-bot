@@ -6,28 +6,43 @@ const {
   fetchAllTokenData
 } = require("./polymarket");
 
-// 缓存上一次 Binance 价格，用来算变化
+// 内存缓存：防止 429 报错
 const lastPrices = {};
+const klinesCache = {};
+let lastKlinesFetchTime = 0;
 
 /**
- * 修复后的获取币安价格函数
- * 自动处理币种到交易对的转换
+ * 修复 451 错误：尝试多个币安 API 终端
  */
 async function fetchBinancePrice(coin) {
   if (coin === "HYPE") return null;
-  try {
-    const symbol = coin + "USDT";
-    const response = await axios.get(`https://api.binance.com/api/v3/ticker/price?symbol=${symbol}`, { timeout: 3000 });
-    return parseFloat(response.data.price);
-  } catch (error) {
-    console.error(`Binance Price Error (${coin}):`, error.message);
-    return null;
+  const symbol = coin + "USDT";
+  
+  // 备选域名列表
+  const endpoints = [
+    `https://api.binance.us/api/v3/ticker/price?symbol=${symbol}`,
+    `https://api1.binance.com/api/v3/ticker/price?symbol=${symbol}`,
+    `https://api.binance.com/api/v3/ticker/price?symbol=${symbol}`
+  ];
+
+  for (const url of endpoints) {
+    try {
+      const response = await axios.get(url, { timeout: 3000 });
+      if (response.data && response.data.price) {
+        return parseFloat(response.data.price);
+      }
+    } catch (error) {
+      // 只有在最后一个也失败时才在控制台打印严重错误
+      if (url === endpoints[endpoints.length - 1]) {
+        console.error(`Binance Price Final Error (${coin}): ${error.message}`);
+      }
+    }
   }
+  return null;
 }
 
 /**
- * 修复后的 K 线获取函数
- * 统一命名为 fetchBinanceKlines，并使用 CoinGecko 作为数据源（规避地区限制）
+ * 修复 429 错误：增加 5 分钟缓存机制
  */
 async function fetchBinanceKlines(coin) {
   const COINGECKO_IDS = {
@@ -39,21 +54,36 @@ async function fetchBinanceKlines(coin) {
   const id = COINGECKO_IDS[coin];
   if (!id) return null;
 
+  const now = Date.now();
+  // 如果 5 分钟（300000ms）内抓取过，直接返回缓存
+  if (klinesCache[id] && (now - lastKlinesFetchTime < 300000)) {
+    return klinesCache[id];
+  }
+
   try {
-    // 使用 CoinGecko OHLC 接口作为稳定来源
+    // 随机延迟 500ms-1500ms，防止并发导致 429
+    await new Promise(resolve => setTimeout(resolve, Math.random() * 1000 + 500));
+
     const res = await axios.get(
       `https://api.coingecko.com/api/v3/coins/${id}/ohlc`,
       {
         params: { vs_currency: "usd", days: "1" },
-        timeout: 8000
+        timeout: 10000
       }
     );
+    
     if (Array.isArray(res.data) && res.data.length > 1) {
-      // 取最后 12 根 K 线的收盘价
-      return res.data.slice(-12).map(candle => candle[4]);
+      const prices = res.data.slice(-12).map(candle => candle[4]);
+      klinesCache[id] = prices; // 存入缓存
+      lastKlinesFetchTime = now;
+      return prices;
     }
     return null;
   } catch (err) {
+    // 如果报 429，尝试使用缓存中的旧数据
+    if (err.response && err.response.status === 429) {
+      return klinesCache[id] || null;
+    }
     console.error(`Klines Error (${coin}):`, err.message);
     return null;
   }
@@ -114,12 +144,9 @@ async function updateMarketData(coins) {
   const markets = await fetchAllMarkets();
 
   for (const coin of coins) {
-    // 这里的函数名现在已经和上面定义的统一了
-    const [binancePrice, klines] = await Promise.all([
-      fetchBinancePrice(coin),
-      fetchBinanceKlines(coin)
-    ]);
-
+    // 串行获取，避免瞬时并发过高
+    const binancePrice = await fetchBinancePrice(coin);
+    const klines = await fetchBinanceKlines(coin);
     const pmData = await fetchPolymarketData(coin, markets);
 
     let priceChange = 0;
@@ -155,7 +182,6 @@ async function updateMarketData(coins) {
   return data;
 }
 
-// 统一导出，确保名字与 updateMarketData 中的调用一致
 module.exports = { 
   updateMarketData, 
   fetchBinancePrice, 
