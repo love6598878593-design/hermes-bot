@@ -1,14 +1,9 @@
 /**
- * Polymarket CLOB API 封装
- *
- * 核心功能:
- * 1. fetchAllMarkets() — 获取所有活跃市场
- * 2. resolveTokenID(markets, keyword) — 自动解析 tokenID
- * 3. getOrderBook(tokenID) — 实时盘口
- * 4. placeLimitOrder(tokenID, side, price, size) — 限价单
- * 5. marketTake(tokenID, side, size) — 吃单
- *
- * 关键词映射: BTC → ["bitcoin", "btc"], ETH → ["ethereum", "eth"], 等等
+ * Polymarket CLOB API 封装 - 修复版
+ * * 核心改进：
+ * 1. 增加 404 错误静默处理，避免日志轰炸
+ * 2. 增强 fetchAllMarkets 的活跃市场过滤，剔除已结束市场
+ * 3. 优化 resolveTokenID 的关键字匹配逻辑
  */
 
 const axios = require("axios");
@@ -16,9 +11,8 @@ const { ClobClient } = require("@polymarket/clob-client");
 
 // ====== 配置 ======
 const POLYMARKET_API = "https://clob.polymarket.com";
-const CHAIN_ID = 137; // Polygon mainnet
+const CHAIN_ID = 137; 
 
-// 7 个核心币的关键词映射
 const KEYWORD_MAP = {
   BTC:  ["bitcoin", "btc", "btcusdt"],
   ETH:  ["ethereum", "eth", "ethusdt"],
@@ -29,24 +23,23 @@ const KEYWORD_MAP = {
   BNB:  ["bnb", "binance coin", "bnbusdt"]
 };
 
-// 缓存市场列表
 let cachedMarkets = null;
 let cachedTime = 0;
-const CACHE_TTL = 5 * 60 * 1000; // 5 min
+const CACHE_TTL = 5 * 60 * 1000; 
 
-// ClobClient 实例（懒加载）
 let clobInstance = null;
 
 function getClobClient() {
   if (clobInstance) return clobInstance;
   const pk = process.env.POLYMARKET_PRIVATE_KEY;
   if (pk) {
+    // 确保这里的初始化符合你使用的 SDK 版本
     clobInstance = new ClobClient(POLYMARKET_API, pk, CHAIN_ID);
   }
   return clobInstance;
 }
 
-// ====== 1. 获取所有活跃市场 ======
+// ====== 1. 获取所有活跃市场 (增加严格过滤) ======
 async function fetchAllMarkets(forceRefresh = false) {
   const now = Date.now();
   if (!forceRefresh && cachedMarkets && (now - cachedTime) < CACHE_TTL) {
@@ -54,201 +47,155 @@ async function fetchAllMarkets(forceRefresh = false) {
   }
 
   try {
-    // 先用 GET /markets 获取活跃市场
-    // 这个接口不需要认证
     const res = await axios.get(`${POLYMARKET_API}/markets`, {
-      params: {
-        closed: false,
-        limit: 200
-      },
+      params: { closed: false, limit: 1000 }, // 扩大搜索范围
       timeout: 15000
     });
 
-    let markets = [];
+    let rawMarkets = [];
+    if (Array.isArray(res.data)) rawMarkets = res.data;
+    else if (res.data?.data) rawMarkets = res.data.data;
+    else if (res.data?.markets) rawMarkets = res.data.markets;
 
-    if (Array.isArray(res.data)) {
-      markets = res.data;
-    } else if (res.data?.data && Array.isArray(res.data.data)) {
-      markets = res.data.data;
-    } else if (res.data?.markets && Array.isArray(res.data.markets)) {
-      markets = res.data.markets;
-    }
+    // 核心修复：只保留未关闭且 active 的市场，彻底避免 404
+    const markets = rawMarkets.filter(m => 
+      m.closed === false && 
+      m.active !== false &&
+      (m.tokens || m.outcomes || m.token_id)
+    );
 
-    // 过滤掉已结束的市场
-    markets = markets.filter(m => m.closed !== true);
-
-    console.log(`   📦 Fetched ${markets.length} active markets from Polymarket`);
+    console.log(`    📦 Fetched ${markets.length} active markets from Polymarket`);
 
     cachedMarkets = markets;
     cachedTime = now;
     return markets;
 
   } catch (err) {
-    console.error(`   Fetch markets error: ${err.message}`);
-    if (cachedMarkets) {
-      console.log(`   Using stale cache (${cachedMarkets.length} markets)`);
-      return cachedMarkets;
-    }
-    return [];
+    console.error(`    Fetch markets error: ${err.message}`);
+    return cachedMarkets || [];
   }
 }
 
-// ====== 2. 自动解析 tokenID ======
-/**
- * 从市场列表中搜索匹配关键词的市场
- * 返回 market + conditionId + yesToken + noToken
- */
+// ====== 2. 自动解析 tokenID (优化匹配) ======
 function resolveTokenID(markets, coin) {
   const keywords = KEYWORD_MAP[coin];
   if (!keywords || !markets || markets.length === 0) return null;
 
-  for (const m of markets) {
-    const question = (m.question || m.description || "").toLowerCase();
+  // 优先匹配包含 "Price" 或 "above/below" 的预测市场，避免匹配到杂乱的活动市场
+  const sortedMarkets = markets.sort((a, b) => {
+    const aDesc = (a.question || a.description || "").toLowerCase();
+    return aDesc.includes("price") ? -1 : 1;
+  });
 
-    // 检查是否包含任意关键词
+  for (const m of sortedMarkets) {
+    const question = (m.question || m.description || "").toLowerCase();
     const match = keywords.some(kw => question.includes(kw));
     if (!match) continue;
 
-    // 提取 tokens
     const tokens = m.tokens || m.outcomes || [];
-    if (tokens.length < 2) {
-      // 有些市场结构不同
-      if (m.conditionId && m.token_id) {
-        return {
-          market: m.question || coin,
-          conditionId: m.conditionId,
-          yesToken: m.token_id,
-          noToken: null
-        };
-      }
-      continue;
+    
+    // 兼容不同的数据结构
+    if (tokens.length >= 2) {
+      return {
+        market: m.question || m.description || coin,
+        conditionId: m.conditionId,
+        yesToken: tokens[0]?.token_id || tokens[0]?.id || tokens[0]?.asset_id,
+        noToken: tokens[1]?.token_id || tokens[1]?.id || tokens[1]?.asset_id,
+        outcomePrices: m.outcomePrices || null
+      };
+    } else if (m.token_id) {
+      return {
+        market: m.question || coin,
+        conditionId: m.conditionId,
+        yesToken: m.token_id,
+        noToken: null
+      };
     }
-
-    return {
-      market: m.question || m.description || coin,
-      conditionId: m.conditionId,
-      yesToken: tokens[0]?.token_id || tokens[0]?.id,
-      noToken: tokens[1]?.token_id || tokens[1]?.id,
-      outcomePrices: m.outcomePrices || null
-    };
   }
-
   return null;
 }
 
-// ====== 3. 实时盘口监控 (Order Book) ======
-async function getOrderBook(tokenID, side = null) {
+// ====== 3. 实时盘口监控 (修复 404 报错) ======
+async function getOrderBook(tokenID) {
+  if (!tokenID) return null;
+  
   try {
-    if (!tokenID) return null;
-
     const client = getClobClient();
+    let book;
+
     if (!client) {
-      // 没有私钥时用 REST API 获取盘口
       const res = await axios.get(`${POLYMARKET_API}/book`, {
         params: { token_id: tokenID },
         timeout: 10000
       });
-
-      const book = res.data;
-      return {
-        bestBid: book.bids?.[0] ? parseFloat(book.bids[0].price) : null,
-        bestAsk: book.asks?.[0] ? parseFloat(book.asks[0].price) : null,
-        bidSize: book.bids?.[0] ? parseFloat(book.bids[0].size) : 0,
-        askSize: book.asks?.[0] ? parseFloat(book.asks[0].size) : 0,
-        spread: book.bids?.[0] && book.asks?.[0]
-          ? parseFloat(book.asks[0].price) - parseFloat(book.bids[0].price)
-          : null,
-        raw: book
-      };
+      book = res.data;
+    } else {
+      book = await client.getOrderBook(tokenID);
     }
 
-    // 用 ClobClient
-    const book = await client.getOrderBook(tokenID);
     if (!book) return null;
 
-    const bids = Array.isArray(book) ? book : (book.bids || []);
-    const asks = Array.isArray(book) ? [] : (book.asks || []);
+    const bids = book.bids || [];
+    const asks = book.asks || [];
 
     return {
       bestBid: bids[0]?.price ? parseFloat(bids[0].price) : null,
       bestAsk: asks[0]?.price ? parseFloat(asks[0].price) : null,
       bidSize: bids[0]?.size ? parseFloat(bids[0].size) : 0,
       askSize: asks[0]?.size ? parseFloat(asks[0].size) : 0,
-      spread: bids[0]?.price && asks[0]?.price
+      spread: (bids[0]?.price && asks[0]?.price)
         ? parseFloat(asks[0].price) - parseFloat(bids[0].price)
         : null,
       raw: book
     };
 
   } catch (err) {
-    console.error(`   OrderBook error: ${err.message}`);
+    // 核心修复：如果是 404 错误（Token 已失效），静默处理不报错
+    if (err.response && err.response.status === 404) {
+      return null;
+    }
+    console.error(`    OrderBook error for ${tokenID.substring(0,8)}: ${err.message}`);
     return null;
   }
 }
 
-// ====== 4. 限价单（挂单） ======
+// ====== 4. 限价单 ======
 async function placeLimitOrder(tokenID, side, price, size) {
   try {
     const client = getClobClient();
-    if (!client) {
-      console.error(`   ClobClient not initialized — set POLYMARKET_PRIVATE_KEY`);
-      return null;
-    }
+    if (!client) return null;
 
-    // ClobClient.createOrder 返回签名的 order
     const order = await client.createOrder({
       tokenID,
       price: price.toString(),
       size: size.toString(),
-      side                    // "BUY" or "SELL"
+      side 
     });
 
-    // 发送到 CLOB
     const result = await client.postOrder(order);
     return {
       success: true,
       orderId: result?.orderId || result?.id,
-      status: result?.status || "PENDING",
       raw: result
     };
-
   } catch (err) {
-    console.error(`   Limit order error: ${err.message}`);
+    console.error(`    Limit order error: ${err.message}`);
     return null;
   }
 }
 
-// ====== 5. 吃单（立即成交） ======
+// ====== 5. 吃单 ======
 async function marketTake(tokenID, side, size) {
-  try {
-    const book = await getOrderBook(tokenID);
-    if (!book) {
-      console.error(`   No order book for token ${tokenID}`);
-      return null;
-    }
+  const book = await getOrderBook(tokenID);
+  if (!book) return null;
 
-    // 吃单价格：买就吃 ask，卖就吃 bid
-    const price = side === "BUY"
-      ? book.bestAsk
-      : book.bestBid;
+  const price = side === "BUY" ? book.bestAsk : book.bestBid;
+  if (!price) return null;
 
-    if (!price) {
-      console.error(`   No ${side === "BUY" ? "ask" : "bid"} price available`);
-      return null;
-    }
-
-    return await placeLimitOrder(tokenID, side, price, size);
-
-  } catch (err) {
-    console.error(`   Market take error: ${err.message}`);
-    return null;
-  }
+  return await placeLimitOrder(tokenID, side, price, size);
 }
 
-// ====== 6. 批量获取所有 7 币的市场数据 ======
-/**
- * 一次性获取所有币的 market + tokenID + order book
- */
+// ====== 6. 批量数据获取 ======
 async function fetchAllTokenData(coins) {
   const markets = await fetchAllMarkets();
   const results = {};
@@ -260,9 +207,7 @@ async function fetchAllTokenData(coins) {
       continue;
     }
 
-    // 获取盘口
     const book = await getOrderBook(tokenInfo.yesToken);
-
     results[coin] = {
       coin,
       found: true,
@@ -270,11 +215,9 @@ async function fetchAllTokenData(coins) {
       conditionId: tokenInfo.conditionId,
       yesToken: tokenInfo.yesToken,
       noToken: tokenInfo.noToken,
-      outcomePrices: tokenInfo.outcomePrices,
       book
     };
   }
-
   return results;
 }
 
