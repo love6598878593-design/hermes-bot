@@ -1,3 +1,21 @@
+// 确保在文件顶部引入了 axios
+const axios = require('axios');
+
+// 添加缺失的函数定义
+async function fetchBinancePrice(symbol) {
+    try {
+        const response = await axios.get(`https://api.binance.com/api/v3/ticker/price?symbol=${symbol}`);
+        return response.data.price;
+    } catch (error) {
+        console.error(`Error fetching price for ${symbol}:`, error.message);
+        return null;
+    }
+}
+
+// ... 其他代码 ...
+
+// 现在的导出就不会报错了
+module.exports = { updateMarketData, fetchBinancePrice, fetchBinanceKlines };
 const axios = require("axios");
 const {
   fetchAllMarkets,
