@@ -39,9 +39,13 @@ function resolveTokenID(markets, coin) {
 
   const names = COIN_MAP[coin.toLowerCase()] || [coin.toLowerCase()];
 
+  // ✅ 整词匹配：用正则 \b 边界，避免 megaeth 匹配 eth、solanke 匹配 sol
   const found = markets.find(m => {
     const slug = (m.slug || "").toLowerCase();
-    return names.some(n => slug.includes(n));
+    return names.some(n => {
+      const regex = new RegExp(`\\b${n}\\b`, "i");
+      return regex.test(slug);
+    });
   });
 
   if (!found) return null;
