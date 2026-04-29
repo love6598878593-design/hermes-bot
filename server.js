@@ -1,58 +1,65 @@
 require("dotenv").config();
-const express = require("express");
-const polymarket = require("./polymarket"); 
-const { executeTrade } = require("./exchange");
-const { checkRisk, resetCycleCounter } = require("./risk");
-// 确保 strategy.js 存在且导出 getSignal
-const strategy = require("./strategy"); 
 
-const COINS = ["BTC", "ETH", "SOL", "XRP", "DOGE", "HYPE", "BNB"];
-let tradeCount = 0;
-let totalProfit = 0;
+const {
+  sendNotification,
+  fetchAllMarkets,
+  resolveTokenID,
+  getMarketPrices
+} = require("./polymarket");
 
-const app = express();
-const PORT = process.env.PORT || 8080;
+const INTERVAL = 60 * 1000; // 1分钟
 
-app.get("/health", (req, res) => {
-  res.json({ status: "running", cycles: tradeCount, profit: totalProfit.toFixed(2) });
-});
-app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
+async function main() {
+  console.log("🤖 Hermes Bot started...\n");
 
-async function runBot() {
-  console.log(`\n[${new Date().toISOString()}] 🤖 Cycle #${++tradeCount}...`);
-  try {
-    const markets = await polymarket.fetchAllMarkets();
-    resetCycleCounter();
-    
-    for (const coin of COINS) {
-      try {
-        const data = polymarket.resolveTokenID(markets, coin);
-        if (!data) {
-          console.log(`   ${coin}: Market not found`);
-          continue;
-        }
+  let cycle = 0;
 
-        // 统一传参结构
-        const signal = await strategy.getSignal(coin, data);
-        if (signal && checkRisk(signal, totalProfit)) {
-          const result = await executeTrade(coin, signal, { [coin]: data });
-          if (result?.success) {
-            totalProfit += (result.profit || 0);
-            await polymarket.sendNotification(`✅ *交易成功*: ${coin} ${signal.action} +$${result.profit}`);
-          }
-        }
-      } catch (coinErr) {
-        console.error(`   ❌ ${coin} 处理出错:`, coinErr.message);
+  setInterval(async () => {
+    cycle++;
+    console.log(`\n🤖 Cycle #${cycle}...`);
+
+    try {
+      // 1️⃣ 拉市场
+      const markets = await fetchAllMarkets();
+
+      if (!markets.length) {
+        console.log("❌ 没有获取到市场");
+        return;
       }
+
+      // 2️⃣ 获取目标币（这里只是示例）
+      const coins = ["bitcoin", "ethereum", "solana"];
+
+      let report = `📊 *Polymarket 市场扫描*\n⏱ Cycle: ${cycle}\n\n`;
+
+      for (const coin of coins) {
+        try {
+          const m = resolveTokenID(markets, coin);
+
+          if (!m) {
+            report += `❌ ${coin.toUpperCase()}: Market not found\n`;
+            continue;
+          }
+
+          report += `🪙 *${coin.toUpperCase()}*\n`;
+          report += `• ${m.title}\n`;
+          report += `• YES: \`${m.yesToken}\`\n`;
+          report += `• NO : \`${m.noToken}\`\n\n`;
+
+        } catch (e) {
+          report += `❌ ${coin.toUpperCase()} error\n`;
+        }
+      }
+
+      // 3️⃣ 输出 + 推送
+      console.log(report);
+      await sendNotification(report);
+
+    } catch (err) {
+      console.error("❌ 主循环错误:", err.message);
     }
-  } catch (err) {
-    console.error(`❌ 全局循环错误:`, err.message);
-  }
+
+  }, INTERVAL);
 }
 
-// 启动通知
-polymarket.sendNotification("🟢 *Hermes Bot 已启动*").catch(() => {});
-
-const interval = process.env.TRADE_INTERVAL_MS || 60000;
-setInterval(runBot, interval);
-runBot();
+main();
