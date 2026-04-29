@@ -17,6 +17,7 @@ process.on('SIGTERM', () => { try { fs.unlinkSync(LOCK_FILE); } catch(e) {} proc
 // ==================== 模块导入 ====================
 const {
   sendNotification,
+  getOrderBook,
   resolveMarket,
   fetchAllMarkets,
   getBalance,
@@ -57,6 +58,13 @@ const stddev = arr => {
   const m = avg(arr);
   return Math.sqrt(arr.reduce((s, x) => s + (x - m) ** 2, 0) / arr.length);
 };
+
+function normalizePrice(p) {
+  const num = Number(p);
+  if (!num || isNaN(num)) return null;
+  if (num > 10000) return num / 1e6;
+  return num;
+}
 
 // ==================== 状态持久化 ====================
 const STATE_FILE = path.join('/tmp', 'hermes_v5_state.json');
@@ -155,11 +163,10 @@ function updateEngine(coin, currentProb) {
 }
 
 // ==================== Control Plane: 纯规则决策引擎 ====================
-function decisionEngine(coin, m, engineOutput) {
+function decisionEngine(coin, engineOutput) {
   const s = state[coin];
-  const { regime, signalStrength, momentum, zVol, shouldAI, currentProb } = engineOutput;
+  const { regime, signalStrength, momentum, shouldAI, currentProb } = engineOutput;
 
-  // 硬阻断规则（从宪法提取）
   if (CONFIG.BLOCKED_REGIMES.includes(regime)) {
     return { allowTrade: false, requireAI: false, reason: `REGIME_BLOCKED:${regime}`, regime, signalStrength, momentum };
   }
@@ -173,17 +180,10 @@ function decisionEngine(coin, m, engineOutput) {
     return { allowTrade: false, requireAI: false, reason: 'COOLDOWN', regime, signalStrength, momentum };
   }
 
-  // 信号过弱 → 不交易但可 AI 观察
-  if (signalStrength < CONFIG.MIN_SIGNAL_STRENGTH) {
-    return { allowTrade: false, requireAI: false, reason: 'SIGNAL_WEAK', regime, signalStrength, momentum };
-  }
-
-  // 强信号覆盖
   if (signalStrength > CONFIG.AI_OVERRIDE_SIGNAL) {
     return { allowTrade: true, requireAI: false, reason: 'STRONG_SIGNAL', regime, signalStrength, momentum };
   }
 
-  // 正常信号 → 需要 AI 审计
   if (shouldAI && !CONFIG.AI_BLOCKED_REGIMES.includes(regime)) {
     return { allowTrade: false, requireAI: true, reason: 'NEEDS_AI_AUDIT', regime, signalStrength, momentum };
   }
@@ -191,18 +191,11 @@ function decisionEngine(coin, m, engineOutput) {
   return { allowTrade: false, requireAI: false, reason: 'NO_TRIGGER', regime, signalStrength, momentum };
 }
 
-// ==================== AI 审计层（预留 DeepSeek 接口） ====================
+// ==================== AI 审计层 ====================
 async function aiAudit(coin, decision) {
   const ctx = LAWS.STRATEGY.substring(0, 500);
-  const prompt = `You are a trade auditor. Strategy: ${ctx}\n\nSignal: ${coin} regime=${decision.regime} strength=${decision.signalStrength.toFixed(3)}\nReturn JSON: {"approve":true/false,"confidence":0-1,"reason":"..."}`;
-
-  console.log(`🧠 [AI Audit] ${coin} → ${prompt.length} chars prompt ready`);
-  // TODO: 接入 DeepSeek
-  // const raw = await callDeepSeek(prompt);
-  // return JSON.parse(raw);
-
-  // 默认：信号强则通过
-  return { approve: decision.signalStrength > 0.3, confidence: 0.7, reason: 'auto' };
+  console.log(`🧠 [AI Audit] ${coin} audit ready`);
+  return { approve: decision.signalStrength > 0.3, confidence: 0.7, reason: 'standalone' };
 }
 
 // ==================== 执行层 ====================
@@ -216,7 +209,7 @@ async function executionSandbox(coin, m, decision, aiResult) {
     return { executed: false, reason: 'AI_REJECTED' };
   }
 
-  const trade = await executeTrade(coin, m.yesToken, m.noToken, decision.currentProb || m.yesPrice);
+  const trade = await executeTrade(coin, m.yesToken, m.noToken, decision.currentProb || 0.5);
   if (trade) {
     state[coin].position = 'LONG';
     state[coin].lastDecisionTime = Date.now();
@@ -253,28 +246,43 @@ async function main() {
       for (const coin of CONFIG.COINS) {
         const m = resolveMarket(markets, coin);
         if (!m) { report += `❌ ${coin.toUpperCase()}: 无市场\n`; continue; }
-        if (m.yesPrice == null) { report += `🪙 *${coin.toUpperCase()}*\n• ${m.title}\n• 价格缺失\n\n`; continue; }
 
-        // Layer 1: Engine
-        const engineOutput = updateEngine(coin, m.yesPrice);
+        // ✅ 价格只来自 CLOB
+        const book = await getOrderBook(m.yesToken);
+        if (!book || !book.bestBid || !book.bestAsk) {
+          report += `🪙 *${coin.toUpperCase()}*\n• ${m.title}\n• 盘口不可用\n\n`;
+          continue;
+        }
 
-        // Layer 2: Control Plane
-        const decision = decisionEngine(coin, m, engineOutput);
+        const bid = normalizePrice(book.bestBid);
+        const ask = normalizePrice(book.bestAsk);
+        if (!bid || !ask) {
+          report += `🪙 *${coin.toUpperCase()}*\n• ${m.title}\n• 价格解析失败\n\n`;
+          continue;
+        }
 
-        // Layer 3: AI Audit (only if needed)
+        const currentProb = (bid + ask) / 2;
+
+        // Engine
+        const engineOutput = updateEngine(coin, currentProb);
+
+        // Control Plane
+        const decision = decisionEngine(coin, engineOutput);
+
+        // AI Audit
         let aiResult = null;
         if (decision.requireAI) {
           aiResult = await aiAudit(coin, decision);
         }
 
-        // Layer 4: Execution Sandbox
+        // Execution
         const execution = decision.allowTrade || decision.requireAI ?
           await executionSandbox(coin, m, decision, aiResult) : { executed: false, reason: decision.reason };
 
         const dir = decision.momentum > 0 ? '📈' : decision.momentum < 0 ? '📉' : '➡️';
         report += `🪙 *${coin.toUpperCase()}*\n`;
         report += `• ${m.title}\n`;
-        report += `• YES $${m.yesPrice.toFixed(4)} | EMA: ${(state[coin].emaShort || 0).toFixed(4)}\n`;
+        report += `• Bid: $${bid.toFixed(4)} | Ask: $${ask.toFixed(4)} | Mid: $${currentProb.toFixed(4)}\n`;
         report += `• 动量: ${decision.momentum >= 0 ? '+' : ''}${decision.momentum.toFixed(5)} ${dir}\n`;
         report += `• 信号: ${decision.signalStrength.toFixed(3)} | Regime: ${decision.regime}\n`;
         report += `• 决策: ${decision.reason}`;
