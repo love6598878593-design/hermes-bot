@@ -1,4 +1,6 @@
 const fetch = require('node-fetch');
+const fs = require('fs');
+const path = require('path');
 
 // ==================== 加权币种映射 ====================
 const COIN_MAP = {
@@ -22,16 +24,30 @@ const WEIGHTS = {
   binance: 5, bnb: 3
 };
 
+// ==================== 噪音过滤词 ====================
+const NOISE_WORDS = ["gta", "solanke", "football", "soccer", "movie", "album", "megaeth", "halving", "grammy", "president", "election"];
+
 // ==================== 带 TTL 的缓存 ====================
 let marketCache = [];
 let cacheTimestamp = 0;
 const CACHE_TTL = 5 * 60 * 1000;
 
 // ==================== 交易安全锁 ====================
+const STATE_FILE = path.join('/tmp', 'hermes_trade_state.json');
 let hasTraded = {};
 let lastTradeTime = {};
 const COOLDOWN = 10 * 60 * 1000;
 const DRY_RUN = (process.env.DRY_RUN || 'true') !== 'false';
+
+function loadTradeState() {
+  try { return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')); } catch { return {}; }
+}
+function saveTradeState(s) {
+  try { fs.writeFileSync(STATE_FILE, JSON.stringify(s)); } catch {}
+}
+const savedTrade = loadTradeState();
+hasTraded = savedTrade.hasTraded || {};
+lastTradeTime = savedTrade.lastTradeTime || {};
 
 // ==================== 工具函数 ====================
 function safeJSON(x, fallback = []) {
@@ -75,15 +91,47 @@ async function sendNotification(msg) {
 // ==================== CLOB Orderbook ====================
 async function getOrderBook(tokenId) {
   if (!tokenId) return null;
+
+  const url = `https://clob.polymarket.com/book?token_id=${tokenId}`;
+  console.log(`📡 getOrderBook: ${url}`);
+
   try {
-    const res = await fetch(`https://clob.polymarket.com/orderbook?token_id=${tokenId}`);
-    const data = await res.json();
-    return {
-      bestBid: data.bids?.[0]?.price || '0',
-      bestAsk: data.asks?.[0]?.price || '0'
-    };
-  } catch(e) {
-    console.error("getOrderBook error:", e.message);
+    const res = await fetch(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+      }
+    });
+
+    console.log(`📡 getOrderBook status: ${res.status}`);
+
+    if (!res.ok) {
+      console.error(`getOrderBook HTTP ${res.status}`);
+      return null;
+    }
+
+    const text = await res.text();
+
+    // 检测 HTML 响应（Cloudflare 拦截）
+    if (text.startsWith('<')) {
+      console.error('getOrderBook: 收到 HTML 响应 (Cloudflare 拦截)');
+      return null;
+    }
+
+    const data = JSON.parse(text);
+
+    const bestBid = data.bids?.[0]?.price || data.bestBid || null;
+    const bestAsk = data.asks?.[0]?.price || data.bestAsk || null;
+
+    if (!bestBid || !bestAsk) {
+      console.error('getOrderBook: 无有效 bid/ask');
+      return null;
+    }
+
+    console.log(`✅ Bid: ${bestBid}, Ask: ${bestAsk}`);
+    return { bestBid, bestAsk };
+
+  } catch (e) {
+    console.error('getOrderBook error:', e.message);
     return null;
   }
 }
@@ -155,10 +203,11 @@ async function safeTrade(coin, yesToken, noToken, currentProb) {
   const token = side === "yes" ? yesToken : noToken;
   lastTradeTime[coin] = Date.now();
   hasTraded[coin] = true;
+  saveTradeState({ hasTraded, lastTradeTime });
   return await placeOrder(token, side, 1);
 }
 
-// ==================== 市场解析 ====================
+// ==================== 市场解析（纯净版，只返回 token） ====================
 function resolveMarket(markets, coin) {
   const names = COIN_MAP[coin.toLowerCase()] || [coin.toLowerCase()];
 
@@ -173,45 +222,29 @@ function resolveMarket(markets, coin) {
 
   const scored = list
     .map(m => {
-      const slug = (m.slug || "").toLowerCase();
-      const title = (m.title || m.question || "").toLowerCase();
+      const text = `${m.slug || ""} ${m.question || m.title || ""}`.toLowerCase();
       let score = 0;
       for (const n of names) {
-        if (slug.includes(n)) score += WEIGHTS[n] || 1;
-        if (title.includes(n)) score += (WEIGHTS[n] || 1) * 2;
+        if (text.includes(n)) score += (WEIGHTS[n] || 2);
       }
+      if (NOISE_WORDS.some(w => text.includes(w))) score -= 5;
       return { m, score };
     })
     .filter(x => x.score > 0)
     .sort((a, b) => b.score - a.score);
 
-  if (scored.length === 0) return null;
+  if (!scored.length) return null;
 
   const found = scored[0].m;
-  const outcomes = safeJSON(found.outcomes);
-  const tokens = safeJSON(found.clobTokenIds);
-  if (tokens.length < 2) return null;
+  const tokens = safeJSON(found.clobTokenIds || found.outcomes);
 
-  let yesIdx = 0, noIdx = 1;
-  for (let i = 0; i < Math.min(outcomes.length, tokens.length); i++) {
-    const label = String(outcomes[i] || "").toLowerCase();
-    if (label === "yes") yesIdx = i;
-    if (label === "no")  noIdx  = i;
-  }
-
-  let yesPrice = null, noPrice = null;
-  if (Array.isArray(found.outcomePrices)) {
-    yesPrice = normalizePrice(found.outcomePrices[yesIdx]);
-    noPrice  = normalizePrice(found.outcomePrices[noIdx]);
-  }
+  if (!tokens || tokens.length < 2) return null;
 
   return {
     title: found.question || found.title || found.slug,
     slug: found.slug,
-    yesToken: tokens[yesIdx],
-    noToken:  tokens[noIdx],
-    yesPrice,
-    noPrice
+    yesToken: tokens[0],
+    noToken: tokens[1]
   };
 }
 
