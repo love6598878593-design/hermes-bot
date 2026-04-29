@@ -1,12 +1,22 @@
 const fetch = require('node-fetch');
 
+const COIN_MAP = {
+  bitcoin:  ["btc",  "bitcoin"],
+  ethereum: ["eth",  "ethereum"],
+  solana:   ["sol", "solana"],
+  xrp:      ["xrp", "ripple"],
+  doge:     ["doge", "dogecoin"],
+  hype:     ["hype", "hyperliquid"],
+  bnb:      ["bnb",  "binance"]
+};
+
 async function sendNotification(msg) {
   const token = process.env.TELEGRAM_BOT_TOKEN;
   const cid   = process.env.TELEGRAM_CHAT_ID;
 
   if (token && cid) {
     try {
-      await fetch(https://api.telegram.org/bot${token}/sendMessage, {
+      await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -15,21 +25,24 @@ async function sendNotification(msg) {
           parse_mode: "Markdown"
         })
       });
+      console.log("📤 Telegram sent");
     } catch(e) {
       console.error("Telegram error:", e.message);
     }
   } else {
-    console.log(ℹ️ [Console] ${msg});
+    console.log(`ℹ️ [Console] ${msg}`);
   }
 }
 
-function resolveTokenID(markets, keyword) {
+function resolveTokenID(markets, coin) {
   if (!markets || !Array.isArray(markets)) return null;
 
-  const found = markets.find(m =>
-    m.slug &&
-    m.slug.toLowerCase().includes(keyword.toLowerCase())
-  );
+  const names = COIN_MAP[coin.toLowerCase()] || [coin.toLowerCase()];
+
+  const found = markets.find(m => {
+    const slug = (m.slug || "").toLowerCase();
+    return names.some(n => slug.includes(n));
+  });
 
   if (!found) return null;
 
@@ -39,18 +52,18 @@ function resolveTokenID(markets, keyword) {
 
     if (tokens.length >= 2) {
       return {
-        title: found.title,
+        title: found.title || found.slug,
         slug: found.slug,
         yesToken: tokens[0],
         noToken: tokens[1],
         outcomes
       };
     }
+
+    return null;
   } catch (e) {
     return null;
   }
-
-  return null;
 }
 
 async function fetchAllMarkets() {
@@ -60,17 +73,10 @@ async function fetchAllMarkets() {
     );
 
     const data = await res.json();
-
     const active = (Array.isArray(data) ? data : [])
       .filter(m => m.active && !m.closed);
 
-    console.log(📦 Polymarket: ${active.length} 个活跃市场);
-
-    // 👉 打印前20个，避免刷屏
-    active.slice(0, 20).forEach(m => {
-      console.log(- ${m.slug});
-    });
-
+    console.log(`📦 Polymarket: ${active.length} 个活跃市场`);
     return active;
 
   } catch(e) {
@@ -79,32 +85,9 @@ async function fetchAllMarkets() {
   }
 }
 
-async function getMarketPrices(markets) {
-  const result = {};
-
-  const targets = ["bitcoin", "ethereum", "solana"];
-
-  for (const t of targets) {
-    const m = resolveTokenID(markets, t);
-
-    if (!m) {
-      result[t] = "Market not found";
-      continue;
-    }
-
-    result[t] = {
-      title: m.title,
-      yesToken: m.yesToken,
-      noToken: m.noToken
-    };
-  }
-
-  return result;
-}
-
 module.exports = {
   sendNotification,
   resolveTokenID,
   fetchAllMarkets,
-  getMarketPrices
+  getMarketPrices: async () => ({})
 };
