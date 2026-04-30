@@ -1,9 +1,9 @@
 {
-  "name": "polymarket-expiry-monitor",
+  "name": "polymarket-whale-daily",
   "version": "1.0.0",
-  "main": "server.js",
+  "main": "whale-tracker.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node whale-tracker.js"
   },
   "dependencies": {
     "axios": "^1.6.0",
