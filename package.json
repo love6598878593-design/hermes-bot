@@ -1,18 +1,12 @@
 {
-  "name": "hermes-bot",
+  "name": "polymarket-expiry-monitor",
   "version": "1.0.0",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js",
-    "postinstall": "npm install tslib --no-save 2>/dev/null || true"
+    "start": "node server.js"
   },
   "dependencies": {
-    "@polymarket/clob-client": "^1.0.0",
     "axios": "^1.6.0",
-    "dotenv": "^16.0.0",
-    "ethers": "^6.12.1",
-    "express": "^4.18.0",
-    "node-fetch": "^2.7.0",
-    "tslib": "^2.6.0"
+    "dotenv": "^16.0.0"
   }
 }
