@@ -1,300 +1,149 @@
 require('dotenv').config();
-const fs = require('fs');
-const path = require('path');
+const axios = require('axios');
 
-// ==================== 实例锁 ====================
-const LOCK_FILE = '/tmp/hermes.lock';
-try {
-  const pid = fs.readFileSync(LOCK_FILE, 'utf8');
-  console.log(`⚠️ 已有实例 (PID: ${pid})，退出`);
-  process.exit(0);
-} catch (e) {
-  fs.writeFileSync(LOCK_FILE, String(process.pid));
-}
-process.on('exit', () => { try { fs.unlinkSync(LOCK_FILE); } catch(e) {} });
-process.on('SIGTERM', () => { try { fs.unlinkSync(LOCK_FILE); } catch(e) {} process.exit(0); });
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 
-// ==================== 模块导入 ====================
-const {
-  sendNotification,
-  getOrderBook,
-  resolveMarket,
-  fetchAllMarkets,
-  getBalance,
-  safeTrade: executeTrade
-} = require('./polymarket');
+// 推送记录（避免重复）
+let lastPushHash = '';
+let lastPushTime = 0;
 
-// ==================== 宪法读取 ====================
-function loadRule(name) {
-  try { return fs.readFileSync(path.join(__dirname, 'hermes-os', `${name}.md`), 'utf8'); }
-  catch { return ''; }
-}
-const LAWS = {
-  SOUL: loadRule('SOUL'),
-  STRATEGY: loadRule('STRATEGY'),
-  EXECUTION: loadRule('EXECUTION'),
-  STATE_MACHINE: loadRule('STATE_MACHINE')
-};
-console.log('📜 宪法加载完成');
-
-// ==================== 配置 ====================
-const CONFIG = {
-  INTERVAL: 30_000,
-  COINS: ['bitcoin', 'ethereum', 'solana'],
-  DEAD_ZONE: 0.002,
-  REGIME_STABILITY_TICKS: 2,
-  VOL_HISTORY_SIZE: 20,
-  MIN_SIGNAL_STRENGTH: 0.2,
-  AI_COOLDOWN: 5 * 60 * 1000,
-  AI_OVERRIDE_SIGNAL: 0.35,
-  BLOCKED_REGIMES: ['CHOP', 'INIT'],
-  AI_BLOCKED_REGIMES: ['CHOP', 'LOW_VOL']
-};
-
-// ==================== 工具 ====================
-const avg = arr => arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : 0;
-const stddev = arr => {
-  if (!arr.length) return 0;
-  const m = avg(arr);
-  return Math.sqrt(arr.reduce((s, x) => s + (x - m) ** 2, 0) / arr.length);
-};
-
-function normalizePrice(p) {
-  const num = Number(p);
-  if (!num || isNaN(num)) return null;
-  if (num > 10000) return num / 1e6;
-  return num;
-}
-
-// ==================== 状态持久化 ====================
-const STATE_FILE = path.join('/tmp', 'hermes_v5_state.json');
-function saveState(s) {
+async function sendTelegram(message) {
+  if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
+    console.log('❌ Telegram未配置');
+    return;
+  }
   try {
-    const min = {};
-    for (const c of CONFIG.COINS) {
-      min[c] = {
-        emaShort: s[c].emaShort, emaLong: s[c].emaLong,
-        regime: s[c].regime, regimeStableCount: s[c].regimeStableCount,
-        position: s[c].position, lastDecisionTime: s[c].lastDecisionTime
-      };
-    }
-    fs.writeFileSync(STATE_FILE, JSON.stringify(min));
-  } catch {}
-}
-function loadState() {
-  try { return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')); } catch { return null; }
+    await axios.post(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+      chat_id: TELEGRAM_CHAT_ID,
+      text: message,
+      parse_mode: 'HTML'
+    });
+    console.log('✅ Telegram推送成功');
+  } catch (e) {
+    console.error('❌ 推送失败:', e.message);
+  }
 }
 
-// ==================== 初始化状态 ====================
-let state = {};
-const saved = loadState();
-for (const c of CONFIG.COINS) {
-  state[c] = {
-    emaShort: saved?.[c]?.emaShort ?? null,
-    emaLong: saved?.[c]?.emaLong ?? null,
-    momentum: 0, absVolatility: 0, zVolatility: 0,
-    volHistory: saved ? [0.005] : [],
-    regime: saved?.[c]?.regime ?? 'INIT',
-    regimeStableCount: saved?.[c]?.regimeStableCount ?? 0,
-    regimeLastChange: 0,
-    signalStrength: 0,
-    lastDecisionTime: saved?.[c]?.lastDecisionTime ?? 0,
-    position: saved?.[c]?.position ?? 'FLAT',
-    lastPrice: null
-  };
-}
-if (saved) console.log('📀 状态已恢复');
-
-// ==================== 量化引擎 ====================
-function aiThreshold(zVol) { return 0.12 + Math.abs(zVol) * 0.6; }
-function classifyRegime(zVol, momentum) {
-  if (zVol < -0.5) return 'LOW_VOL';
-  if (Math.abs(momentum) > 0.004) return 'TREND';
-  return 'CHOP';
-}
-
-function updateEngine(coin, currentProb) {
-  const s = state[coin];
-  if (s.lastPrice === currentProb) {
-    return { signalStrength: s.signalStrength, momentum: s.momentum, regime: s.regime,
-             zVol: s.zVolatility, shouldAI: false, currentProb };
+async function getTodayExpiringMarkets() {
+  // 北京时间今天的起止时间
+  const now = new Date();
+  const beijingTime = new Date(now.getTime() + 8 * 60 * 60 * 1000);
+  
+  const start = new Date(beijingTime);
+  start.setHours(0, 0, 0, 0);
+  const startUTC = new Date(start.getTime() - 8 * 60 * 60 * 1000).toISOString().replace(/\.\d+Z$/, 'Z');
+  
+  const end = new Date(beijingTime);
+  end.setHours(23, 59, 59, 999);
+  const endUTC = new Date(end.getTime() - 8 * 60 * 60 * 1000).toISOString().replace(/\.\d+Z$/, 'Z');
+  
+  console.log(`📅 查询范围: ${startUTC} ~ ${endUTC}`);
+  
+  try {
+    const response = await axios.get('https://gamma-api.polymarket.com/markets', {
+      params: {
+        closed: 'false',
+        end_date_min: startUTC,
+        end_date_max: endUTC,
+        order: 'volume24hr',
+        ascending: 'false',
+        limit: 30
+      },
+      timeout: 15000
+    });
+    
+    const markets = response.data;
+    console.log(`📊 API返回 ${markets.length} 个市场`);
+    
+    // 过滤交易量 >= 500 美元
+    const filtered = markets.filter(m => parseFloat(m.volume24hr || 0) >= 500);
+    console.log(`💰 过滤后（交易量≥$500）: ${filtered.length} 个`);
+    
+    return filtered;
+  } catch (e) {
+    console.error('❌ API错误:', e.message);
+    return [];
   }
-  s.lastPrice = currentProb;
-
-  if (s.emaShort === null) {
-    s.emaShort = currentProb; s.emaLong = currentProb;
-    s.volHistory = [0.001]; s.regime = 'INIT';
-    return { signalStrength: 0, momentum: 0, regime: 'INIT', zVol: 0, shouldAI: false, currentProb };
-  }
-
-  const instantVol = Math.abs(currentProb - s.emaShort);
-  const alpha = 0.4 / (1 + instantVol * 15);
-  s.emaShort = (currentProb * alpha) + (s.emaShort * (1 - alpha));
-  s.emaLong  = (currentProb * (alpha * 0.4)) + (s.emaLong * (1 - alpha * 0.4));
-
-  let mom = s.emaShort - s.emaLong;
-  if (Math.abs(mom) < CONFIG.DEAD_ZONE) mom = 0;
-  s.momentum = mom;
-
-  s.absVolatility = (instantVol * 0.1) + (s.absVolatility * 0.9);
-  s.volHistory.push(s.absVolatility);
-  if (s.volHistory.length > CONFIG.VOL_HISTORY_SIZE) s.volHistory.shift();
-
-  const zVol = (s.absVolatility - avg(s.volHistory)) / (stddev(s.volHistory) + 1e-6);
-  s.zVolatility = zVol;
-
-  const newRegime = classifyRegime(zVol, mom);
-  if (newRegime === s.regime) s.regimeStableCount++;
-  else { s.regime = newRegime; s.regimeStableCount = 0; s.regimeLastChange = Date.now(); }
-
-  const structuralShift = (newRegime === 'TREND' && s.regimeStableCount === 0) || Math.abs(mom) > CONFIG.DEAD_ZONE * 2;
-  const signalStrength = Math.abs(zVol) > 0 ? Math.abs(mom) / (Math.abs(zVol) + 0.001) : 0;
-  s.signalStrength = signalStrength;
-
-  const shouldAI = structuralShift && signalStrength > aiThreshold(zVol) &&
-    s.regimeStableCount >= CONFIG.REGIME_STABILITY_TICKS &&
-    !CONFIG.AI_BLOCKED_REGIMES.includes(s.regime) &&
-    currentProb > 0.1 && currentProb < 0.9 &&
-    (Date.now() - s.lastDecisionTime > CONFIG.AI_COOLDOWN);
-
-  if (shouldAI) s.lastDecisionTime = Date.now();
-
-  return { signalStrength, momentum: mom, regime: s.regime, zVol, shouldAI, currentProb };
 }
 
-// ==================== Control Plane: 纯规则决策引擎 ====================
-function decisionEngine(coin, engineOutput) {
-  const s = state[coin];
-  const { regime, signalStrength, momentum, shouldAI, currentProb } = engineOutput;
-
-  if (CONFIG.BLOCKED_REGIMES.includes(regime)) {
-    return { allowTrade: false, requireAI: false, reason: `REGIME_BLOCKED:${regime}`, regime, signalStrength, momentum };
+async function getMarketProbability(tokenId) {
+  if (!tokenId) return null;
+  try {
+    const res = await axios.get(`https://clob.polymarket.com/last-trade-price?token_id=${tokenId}`, {
+      timeout: 5000
+    });
+    const price = parseFloat(res.data.price || 0);
+    return price > 0 ? Math.round(price * 100) : null;
+  } catch (e) {
+    return null;
   }
-  if (s.position !== 'FLAT') {
-    return { allowTrade: false, requireAI: false, reason: 'POSITION_OPEN', regime, signalStrength, momentum };
-  }
-  if (currentProb < 0.1 || currentProb > 0.9) {
-    return { allowTrade: false, requireAI: false, reason: 'EXTREME_PROB', regime, signalStrength, momentum };
-  }
-  if (Date.now() - s.lastDecisionTime < CONFIG.AI_COOLDOWN) {
-    return { allowTrade: false, requireAI: false, reason: 'COOLDOWN', regime, signalStrength, momentum };
-  }
-
-  if (signalStrength > CONFIG.AI_OVERRIDE_SIGNAL) {
-    return { allowTrade: true, requireAI: false, reason: 'STRONG_SIGNAL', regime, signalStrength, momentum };
-  }
-
-  if (shouldAI && !CONFIG.AI_BLOCKED_REGIMES.includes(regime)) {
-    return { allowTrade: false, requireAI: true, reason: 'NEEDS_AI_AUDIT', regime, signalStrength, momentum };
-  }
-
-  return { allowTrade: false, requireAI: false, reason: 'NO_TRIGGER', regime, signalStrength, momentum };
 }
-
-// ==================== AI 审计层 ====================
-async function aiAudit(coin, decision) {
-  const ctx = LAWS.STRATEGY.substring(0, 500);
-  console.log(`🧠 [AI Audit] ${coin} audit ready`);
-  return { approve: decision.signalStrength > 0.3, confidence: 0.7, reason: 'standalone' };
-}
-
-// ==================== 执行层 ====================
-async function executionSandbox(coin, m, decision, aiResult) {
-  if (!decision.allowTrade && !(decision.requireAI && aiResult?.approve)) {
-    return { executed: false, reason: decision.reason };
-  }
-
-  const finalAllow = decision.allowTrade || (decision.requireAI && aiResult?.approve);
-  if (!finalAllow) {
-    return { executed: false, reason: 'AI_REJECTED' };
-  }
-
-  const trade = await executeTrade(coin, m.yesToken, m.noToken, decision.currentProb || 0.5);
-  if (trade) {
-    state[coin].position = 'LONG';
-    state[coin].lastDecisionTime = Date.now();
-    saveState(state);
-    return { executed: true, reason: decision.requireAI ? 'AI_APPROVED' : 'STRONG_SIGNAL' };
-  }
-
-  return { executed: false, reason: 'EXECUTION_FAILED' };
-}
-
-// ==================== 主循环 ====================
-let mainInterval = null;
 
 async function main() {
-  if (mainInterval) clearInterval(mainInterval);
-  console.log('🏛️ Hermes V5 Production Engine 启动\n');
-
-  try {
-    const balance = await getBalance();
-    if (balance) await sendNotification(`💰 *余额: $${balance.balance || 'N/A'}`);
-  } catch {}
-
-  let markets = await fetchAllMarkets();
-  let cycle = 0;
-
-  mainInterval = setInterval(async () => {
-    cycle++;
-    console.log(`\n🏛️ Cycle #${cycle}`);
-
-    try {
-      if (cycle % 3 === 0) markets = await fetchAllMarkets();
-      let report = `📊 *Hermes V5 PROD*\n⏱ Cycle: ${cycle}\n\n`;
-
-      for (const coin of CONFIG.COINS) {
-        const m = resolveMarket(markets, coin);
-        if (!m) { report += `❌ ${coin.toUpperCase()}: 无市场\n`; continue; }
-
-        // ✅ 价格只来自 CLOB
-        const book = await getOrderBook(m.yesToken);
-        if (!book || !book.bestBid || !book.bestAsk) {
-          report += `🪙 *${coin.toUpperCase()}*\n• ${m.title}\n• 盘口不可用\n\n`;
-          continue;
-        }
-
-        const bid = normalizePrice(book.bestBid);
-        const ask = normalizePrice(book.bestAsk);
-        if (!bid || !ask) {
-          report += `🪙 *${coin.toUpperCase()}*\n• ${m.title}\n• 价格解析失败\n\n`;
-          continue;
-        }
-
-        const currentProb = (bid + ask) / 2;
-
-        // Engine
-        const engineOutput = updateEngine(coin, currentProb);
-
-        // Control Plane
-        const decision = decisionEngine(coin, engineOutput);
-
-        // AI Audit
-        let aiResult = null;
-        if (decision.requireAI) {
-          aiResult = await aiAudit(coin, decision);
-        }
-
-        // Execution
-        const execution = decision.allowTrade || decision.requireAI ?
-          await executionSandbox(coin, m, decision, aiResult) : { executed: false, reason: decision.reason };
-
-        const dir = decision.momentum > 0 ? '📈' : decision.momentum < 0 ? '📉' : '➡️';
-        report += `🪙 *${coin.toUpperCase()}*\n`;
-        report += `• ${m.title}\n`;
-        report += `• Bid: $${bid.toFixed(4)} | Ask: $${ask.toFixed(4)} | Mid: $${currentProb.toFixed(4)}\n`;
-        report += `• 动量: ${decision.momentum >= 0 ? '+' : ''}${decision.momentum.toFixed(5)} ${dir}\n`;
-        report += `• 信号: ${decision.signalStrength.toFixed(3)} | Regime: ${decision.regime}\n`;
-        report += `• 决策: ${decision.reason}`;
-        if (aiResult) report += ` | AI: ${aiResult.approve ? '✅' : '❌'}`;
-        if (execution.executed) report += ` | ✅ 已执行`;
-        report += `\n\n`;
-      }
-
-      console.log(report);
-      await sendNotification(report);
-    } catch (err) { console.error('❌', err.message); }
-  }, CONFIG.INTERVAL);
+  console.log(`\n[${new Date().toISOString()}] 🔍 开始扫描...`);
+  
+  const markets = await getTodayExpiringMarkets();
+  
+  if (markets.length === 0) {
+    console.log('📭 今日无符合条件的到期项目');
+    return;
+  }
+  
+  // 生成推送指纹（项目ID + 交易量分档）
+  const hashParts = markets.map(m => `${m.id}:${Math.floor(parseFloat(m.volume24hr || 0) / 1000)}`);
+  const currentHash = hashParts.join('|');
+  const now = Date.now();
+  
+  // 30分钟内不重复推送
+  if (currentHash === lastPushHash && (now - lastPushTime) < 30 * 60 * 1000) {
+    console.log('⏸️ 内容无变化且未满30分钟，跳过推送');
+    return;
+  }
+  
+  lastPushHash = currentHash;
+  lastPushTime = now;
+  
+  // 构建推送消息
+  let msg = '🔥 <b>Polymarket 今日到期项目</b>\n\n';
+  
+  for (const m of markets) {
+    // 获取实时概率
+    const tokenId = m.clobTokenIds?.[0];
+    const prob = tokenId ? await getMarketProbability(tokenId) : null;
+    const probText = prob ? `${prob}%` : 'N/A';
+    
+    const volume = parseFloat(m.volume24hr || 0).toLocaleString();
+    const endDate = new Date(m.end_date_iso).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' });
+    
+    const probIcon = prob !== null && prob >= 70 ? '📈' : (prob !== null && prob <= 30 ? '📉' : '⚖️');
+    
+    msg += `${probIcon} <b>${m.question}</b>\n`;
+    msg += `   概率: ${probText} | 交易量: $${volume}\n`;
+    msg += `   到期: ${endDate}\n`;
+    msg += `   🔗 https://polymarket.com/event/${m.slug || m.id}\n\n`;
+  }
+  
+  msg += `\n⏰ 下次检查: 30分钟后`;
+  
+  await sendTelegram(msg);
+  console.log(`✅ 已推送 ${markets.length} 个项目`);
 }
 
-main().catch(console.error);
+// 启动
+console.log('🚀 Polymarket 到期监控启动');
+console.log(`⏱️ 检查间隔: 30分钟`);
+console.log(`💰 最低交易量: $500`);
+console.log(`🤖 Telegram: ${TELEGRAM_BOT_TOKEN ? '已配置 ✅' : '未配置 ❌'}\n`);
+
+// 立即执行一次
+main();
+
+// 每30分钟执行一次
+setInterval(main, 30 * 60 * 1000);
+
+// 优雅退出
+process.on('SIGTERM', () => {
+  console.log('\n👋 监控已停止');
+  process.exit(0);
+});
