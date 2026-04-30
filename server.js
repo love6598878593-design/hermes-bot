@@ -26,19 +26,22 @@ async function sendTelegram(message) {
   }
 }
 
-async function getTodayExpiringMarkets() {
+async function getExpiringMarkets(daysAhead = 7) {
   const now = new Date();
   const beijingTime = new Date(now.getTime() + 8 * 60 * 60 * 1000);
   
+  // 今天开始
   const start = new Date(beijingTime);
   start.setHours(0, 0, 0, 0);
   const startUTC = new Date(start.getTime() - 8 * 60 * 60 * 1000).toISOString().replace(/\.\d+Z$/, 'Z');
   
+  // daysAhead 天后结束
   const end = new Date(beijingTime);
+  end.setDate(end.getDate() + daysAhead);
   end.setHours(23, 59, 59, 999);
   const endUTC = new Date(end.getTime() - 8 * 60 * 60 * 1000).toISOString().replace(/\.\d+Z$/, 'Z');
   
-  console.log(`📅 查询范围: ${startUTC} ~ ${endUTC}`);
+  console.log(`📅 查询范围: ${startUTC} ~ ${endUTC} (未来${daysAhead}天)`);
   
   try {
     const response = await axios.get('https://gamma-api.polymarket.com/markets', {
@@ -48,7 +51,7 @@ async function getTodayExpiringMarkets() {
         end_date_max: endUTC,
         order: 'volume24hr',
         ascending: 'false',
-        limit: 50
+        limit: 100
       },
       timeout: 15000
     });
@@ -67,14 +70,23 @@ async function getTodayExpiringMarkets() {
       return volume >= 500 && hasValidDate && hasTokenId;
     });
     
-    // 按交易量排序，取前10
-    filtered.sort((a, b) => parseFloat(b.volume24hr || 0) - parseFloat(a.volume24hr || 0));
-    const top10 = filtered.slice(0, 10);
+    // 按到期时间排序（最近的在前），交易量作为次要排序
+    filtered.sort((a, b) => {
+      const dateA = new Date(a.end_date_iso);
+      const dateB = new Date(b.end_date_iso);
+      if (dateA.getTime() === dateB.getTime()) {
+        return parseFloat(b.volume24hr || 0) - parseFloat(a.volume24hr || 0);
+      }
+      return dateA - dateB;
+    });
     
-    console.log(`💰 过滤后: ${filtered.length} 个有效市场，推送前 ${top10.length} 个`);
-    console.log(`❌ 过滤掉 ${markets.length - filtered.length} 个无效市场（无日期或无token）`);
+    // 取前20个
+    const top20 = filtered.slice(0, 20);
     
-    return top10;
+    console.log(`💰 有效市场: ${filtered.length} 个，推送前 ${top20.length} 个`);
+    console.log(`❌ 过滤掉 ${markets.length - filtered.length} 个无效市场`);
+    
+    return top20;
   } catch (e) {
     console.error('❌ API错误:', e.message);
     return [];
@@ -97,72 +109,11 @@ async function getMarketProbability(tokenId) {
 async function main() {
   console.log(`\n[${new Date().toISOString()}] 🔍 开始扫描...`);
   
-  const markets = await getTodayExpiringMarkets();
+  const markets = await getExpiringMarkets(7);  // 未来7天
   
   if (markets.length === 0) {
-    console.log('📭 今日无有效到期项目');
+    console.log('📭 未来7天无有效到期项目');
     return;
   }
   
-  const hashParts = markets.map(m => `${m.id}:${Math.floor(parseFloat(m.volume24hr || 0) / 1000)}`);
-  const currentHash = hashParts.join('|');
-  const now = Date.now();
-  
-  if (currentHash === lastPushHash && (now - lastPushTime) < 30 * 60 * 1000) {
-    console.log('⏸️ 内容无变化且未满30分钟，跳过推送');
-    return;
-  }
-  
-  lastPushHash = currentHash;
-  lastPushTime = now;
-  
-  // 获取概率
-  const enriched = [];
-  for (const m of markets) {
-    const tokenId = m.clobTokenIds?.[0];
-    const prob = await getMarketProbability(tokenId);
-    enriched.push({
-      question: m.question,
-      prob: prob,
-      volume: parseFloat(m.volume24hr || 0).toLocaleString(),
-      slug: m.slug || m.id,
-      endDate: new Date(m.end_date_iso).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })
-    });
-  }
-  
-  // 分批推送
-  const batchSize = 5;
-  for (let i = 0; i < enriched.length; i += batchSize) {
-    const batch = enriched.slice(i, i + batchSize);
-    let msg = `🔥 <b>Polymarket 今日到期项目</b> ${i/batchSize + 1}/${Math.ceil(enriched.length/batchSize)}\n\n`;
-    
-    for (const m of batch) {
-      const probText = m.prob !== null ? `${m.prob}%` : '获取中';
-      const probIcon = m.prob !== null && m.prob >= 70 ? '📈' : (m.prob !== null && m.prob <= 30 ? '📉' : '⚖️');
-      
-      msg += `${probIcon} <b>${m.question}</b>\n`;
-      msg += `   概率: ${probText} | 交易量: $${m.volume}\n`;
-      msg += `   到期: ${m.endDate}\n`;
-      msg += `   🔗 https://polymarket.com/event/${m.slug}\n\n`;
-    }
-    
-    await sendTelegram(msg);
-    await new Promise(resolve => setTimeout(resolve, 1000));
-  }
-  
-  console.log(`✅ 已推送 ${enriched.length} 个项目`);
-}
-
-console.log('🚀 Polymarket 到期监控启动');
-console.log(`⏱️ 检查间隔: 30分钟`);
-console.log(`💰 最低交易量: $500`);
-console.log(`📊 推送条件: 有效日期 + 有效Token + 交易量前10`);
-console.log(`🤖 Telegram: ${TELEGRAM_BOT_TOKEN ? '已配置 ✅' : '未配置 ❌'}\n`);
-
-main();
-setInterval(main, 30 * 60 * 1000);
-
-process.on('SIGTERM', () => {
-  console.log('\n👋 监控已停止');
-  process.exit(0);
-});
+  const hashParts = markets.map(m => `${m
