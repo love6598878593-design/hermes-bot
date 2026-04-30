@@ -4,7 +4,6 @@ const axios = require('axios');
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 
-// 推送记录
 let lastPushHash = '';
 let lastPushTime = 0;
 
@@ -54,16 +53,27 @@ async function getTodayExpiringMarkets() {
       timeout: 15000
     });
     
-    const markets = response.data;
+    let markets = response.data;
     console.log(`📊 API返回 ${markets.length} 个市场`);
     
-    // 过滤交易量 >= 500 美元
-    const filtered = markets.filter(m => parseFloat(m.volume24hr || 0) >= 500);
-    // 按交易量排序，取前10个
+    // 过滤条件：
+    // 1. 交易量 >= 500
+    // 2. 有有效的 end_date_iso
+    // 3. 有 clobTokenIds
+    const filtered = markets.filter(m => {
+      const volume = parseFloat(m.volume24hr || 0);
+      const hasValidDate = m.end_date_iso && m.end_date_iso !== '' && !isNaN(new Date(m.end_date_iso).getTime());
+      const hasTokenId = m.clobTokenIds && m.clobTokenIds.length > 0;
+      return volume >= 500 && hasValidDate && hasTokenId;
+    });
+    
+    // 按交易量排序，取前10
     filtered.sort((a, b) => parseFloat(b.volume24hr || 0) - parseFloat(a.volume24hr || 0));
     const top10 = filtered.slice(0, 10);
     
-    console.log(`💰 过滤后: ${filtered.length} 个，推送前10个`);
+    console.log(`💰 过滤后: ${filtered.length} 个有效市场，推送前 ${top10.length} 个`);
+    console.log(`❌ 过滤掉 ${markets.length - filtered.length} 个无效市场（无日期或无token）`);
+    
     return top10;
   } catch (e) {
     console.error('❌ API错误:', e.message);
@@ -90,16 +100,14 @@ async function main() {
   const markets = await getTodayExpiringMarkets();
   
   if (markets.length === 0) {
-    console.log('📭 今日无符合条件的到期项目');
+    console.log('📭 今日无有效到期项目');
     return;
   }
   
-  // 生成推送指纹
   const hashParts = markets.map(m => `${m.id}:${Math.floor(parseFloat(m.volume24hr || 0) / 1000)}`);
   const currentHash = hashParts.join('|');
   const now = Date.now();
   
-  // 30分钟内不重复推送
   if (currentHash === lastPushHash && (now - lastPushTime) < 30 * 60 * 1000) {
     console.log('⏸️ 内容无变化且未满30分钟，跳过推送');
     return;
@@ -108,11 +116,11 @@ async function main() {
   lastPushHash = currentHash;
   lastPushTime = now;
   
-  // 获取每个项目的概率
+  // 获取概率
   const enriched = [];
   for (const m of markets) {
     const tokenId = m.clobTokenIds?.[0];
-    const prob = tokenId ? await getMarketProbability(tokenId) : null;
+    const prob = await getMarketProbability(tokenId);
     enriched.push({
       question: m.question,
       prob: prob,
@@ -122,14 +130,14 @@ async function main() {
     });
   }
   
-  // 分批推送（每批最多5个项目，避免消息过长）
+  // 分批推送
   const batchSize = 5;
   for (let i = 0; i < enriched.length; i += batchSize) {
     const batch = enriched.slice(i, i + batchSize);
     let msg = `🔥 <b>Polymarket 今日到期项目</b> ${i/batchSize + 1}/${Math.ceil(enriched.length/batchSize)}\n\n`;
     
     for (const m of batch) {
-      const probText = m.prob !== null ? `${m.prob}%` : 'N/A';
+      const probText = m.prob !== null ? `${m.prob}%` : '获取中';
       const probIcon = m.prob !== null && m.prob >= 70 ? '📈' : (m.prob !== null && m.prob <= 30 ? '📉' : '⚖️');
       
       msg += `${probIcon} <b>${m.question}</b>\n`;
@@ -139,24 +147,19 @@ async function main() {
     }
     
     await sendTelegram(msg);
-    // 分批之间延迟1秒，避免限流
     await new Promise(resolve => setTimeout(resolve, 1000));
   }
   
-  console.log(`✅ 已推送 ${enriched.length} 个项目（分${Math.ceil(enriched.length/batchSize)}批）`);
+  console.log(`✅ 已推送 ${enriched.length} 个项目`);
 }
 
-// 启动
 console.log('🚀 Polymarket 到期监控启动');
 console.log(`⏱️ 检查间隔: 30分钟`);
 console.log(`💰 最低交易量: $500`);
-console.log(`📊 推送数量: 前10个（按交易量排序）`);
+console.log(`📊 推送条件: 有效日期 + 有效Token + 交易量前10`);
 console.log(`🤖 Telegram: ${TELEGRAM_BOT_TOKEN ? '已配置 ✅' : '未配置 ❌'}\n`);
 
-// 立即执行一次
 main();
-
-// 每30分钟执行一次
 setInterval(main, 30 * 60 * 1000);
 
 process.on('SIGTERM', () => {
